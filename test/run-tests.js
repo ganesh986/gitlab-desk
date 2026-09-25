@@ -143,6 +143,158 @@ async function t(name, fn) {
     assert.deepStrictEqual(s.files.map((f) => f.path), ['.gitignore']);
   });
 
+  console.log('Branch: merge, squash, rebase, stash');
+  const w = (f, c) => fs.writeFileSync(path.join(repo, f), c);
+  const commitAll = async (msg) => { const st = await git.status(repo); await git.commit(repo, { paths: st.files.flatMap((f) => (f.origPath ? [f.path, f.origPath] : [f.path])), summary: msg }); };
+  await commitAll('Aggiunge .gitignore');
+  await t('confronto e anteprima merge senza conflitti', async () => {
+    await git.createBranch(repo, 'feat/a');
+    w('a.txt', 'uno\n'); await commitAll('A1');
+    w('b.txt', 'due\n'); await commitAll('A2');
+    await git.checkout(repo, 'main');
+    assert.deepStrictEqual(await git.compare(repo, 'feat/a'), { ahead: 0, behind: 2 });
+    const p = await git.mergePreview(repo, 'feat/a');
+    assert.strictEqual(p.incoming, 2); assert.ok(p.fastForward);
+  });
+  await t('merge pulito', async () => {
+    const r = await git.merge(repo, 'feat/a');
+    assert.strictEqual(r.conflicts, false);
+    assert.ok(fs.existsSync(path.join(repo, 'b.txt')));
+  });
+  await t('merge con modifiche locali bloccato', async () => {
+    w('sporco.txt', 'x');
+    await assert.rejects(git.merge(repo, 'feat/a'), (e) => e.code === 'DIRTY');
+  });
+  await t('stash, elenco e ripristino', async () => {
+    assert.strictEqual(await git.stashAll(repo, 'main'), 1);
+    assert.strictEqual((await git.status(repo)).files.length, 0);
+    const list = await git.stashList(repo);
+    assert.strictEqual(list.length, 1); assert.strictEqual(list[0].branch, 'main');
+    assert.deepStrictEqual(await git.stashFiles(repo, list[0].ref), ['sporco.txt']);
+    await git.stashPop(repo, list[0].ref);
+    assert.strictEqual((await git.status(repo)).files.length, 1);
+    await git.discard(repo, (await git.status(repo)).files);
+  });
+  await t('conflitto previsto, merge, blocco dei segni e completamento', async () => {
+    await git.createBranch(repo, 'feat/b');
+    w('a.txt', 'versione B\n'); await commitAll('B');
+    await git.checkout(repo, 'main');
+    w('a.txt', 'versione main\n'); await commitAll('M');
+    const p = await git.mergePreview(repo, 'feat/b');
+    assert.deepStrictEqual(p.conflicts, ['a.txt']);
+    const r = await git.merge(repo, 'feat/b');
+    assert.ok(r.conflicts);
+    const s = await git.status(repo);
+    assert.strictEqual(s.state, 'merging'); assert.strictEqual(s.conflicts, 1);
+    const msg = await git.pendingMessage(repo);
+    assert.match(msg.summary, /Merge branch 'feat\/b'/);
+    await assert.rejects(git.commit(repo, { paths: ['a.txt'], summary: msg.summary }), /segni di conflitto/);
+    w('a.txt', 'versione risolta\n');
+    await git.commit(repo, { paths: ['a.txt'], summary: msg.summary });
+    const [last] = await git.log(repo, { limit: 1 });
+    const parents = (await git.run(repo, ['rev-list', '--parents', '-n1', 'HEAD'])).trim().split(' ');
+    assert.strictEqual(parents.length, 3, 'deve essere un vero commit di merge');
+    assert.strictEqual((await git.status(repo)).state, null);
+    assert.ok(last);
+  });
+  await t('annulla merge', async () => {
+    await git.createBranch(repo, 'feat/c');
+    w('a.txt', 'C\n'); await commitAll('C');
+    await git.checkout(repo, 'main');
+    w('a.txt', 'main2\n'); await commitAll('M2');
+    assert.ok((await git.merge(repo, 'feat/c')).conflicts);
+    await git.abortMerge(repo);
+    const s = await git.status(repo);
+    assert.strictEqual(s.state, null); assert.strictEqual(s.files.length, 0);
+  });
+  await t('squash e unisci', async () => {
+    await git.createBranch(repo, 'feat/d');
+    w('d1.txt', '1\n'); await commitAll('D1');
+    w('d2.txt', '2\n'); await commitAll('D2');
+    await git.checkout(repo, 'main');
+    const r = await git.merge(repo, 'feat/d', { squash: true });
+    assert.strictEqual(r.conflicts, false);
+    const s = await git.status(repo);
+    assert.strictEqual(s.files.length, 2);
+    assert.strictEqual((await git.pendingMessage(repo)).kind, 'squash');
+    await commitAll('Squash di feat/d');
+    const parents = (await git.run(repo, ['rev-list', '--parents', '-n1', 'HEAD'])).trim().split(' ');
+    assert.strictEqual(parents.length, 2);
+  });
+  await t('rebase con conflitto e continua', async () => {
+    await git.checkout(repo, 'feat/c');
+    const r = await git.rebase(repo, 'main');
+    assert.ok(r.conflicts);
+    const s = await git.status(repo);
+    assert.strictEqual(s.state, 'rebasing'); assert.strictEqual(s.rebaseBranch, 'feat/c');
+    await assert.rejects(git.rebaseContinue(repo), /segni di conflitto/);
+    await assert.rejects(git.commit(repo, { paths: ['a.txt'], summary: 'x' }), /rebase/);
+    w('a.txt', 'risolto rebase\n');
+    const c = await git.rebaseContinue(repo);
+    assert.ok(c.done);
+    const after = await git.status(repo);
+    assert.strictEqual(after.branch, 'feat/c'); assert.strictEqual(after.state, null);
+    assert.deepStrictEqual(await git.compare(repo, 'main'), { ahead: 1, behind: 0 });
+  });
+  await t('branch riscritto con rebase riconosciuto', async () => {
+    const bare2 = path.join(tmp, 'r2.git');
+    await git.run(tmp, ['init', '-q', '--bare', '-b', 'main', bare2]);
+    await git.run(repo, ['remote', 'set-url', 'origin', bare2]);
+    await git.run(repo, ['push', '-q', 'origin', 'main']);
+    await git.createBranch(repo, 'feat/f');
+    w('f.txt', 'f\n'); await commitAll('F');
+    await git.push(repo, null);
+    await git.checkout(repo, 'main');
+    w('g.txt', 'g\n'); await commitAll('G');
+    await git.run(repo, ['push', '-q', 'origin', 'main']);
+    await git.checkout(repo, 'feat/f');
+    assert.strictEqual((await git.rebase(repo, 'main')).conflicts, false);
+    let s = await git.status(repo);
+    assert.ok(s.ahead && s.behind && s.rebased);
+    await git.forcePush(repo, null);
+    s = await git.status(repo);
+    assert.strictEqual(s.ahead + s.behind, 0);
+  });
+  await t('file di un commit, rinomina, immagini e diff per file', async () => {
+    fs.writeFileSync(path.join(repo, 'logo.png'), Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex'));
+    w('vecchio nome.txt', 'contenuto invariato\nper la rinomina\n');
+    await commitAll('Aggiunge logo');
+    await git.run(repo, ['mv', 'vecchio nome.txt', 'nuovo nome.txt']);
+    w('f.txt', 'f modificato\n');
+    await git.run(repo, ['rm', '-q', 'g.txt']);
+    await commitAll('Rinomina e modifica');
+    const [c] = await git.log(repo, { limit: 1 });
+    const { files, isMerge } = await git.commitFiles(repo, c.sha);
+    assert.strictEqual(isMerge, false);
+    const byPath = Object.fromEntries(files.map((f) => [f.path, f]));
+    assert.strictEqual(byPath['nuovo nome.txt'].kind, 'renamed');
+    assert.strictEqual(byPath['nuovo nome.txt'].origPath, 'vecchio nome.txt');
+    assert.strictEqual(byPath['f.txt'].kind, 'modified');
+    assert.strictEqual(byPath['g.txt'].kind, 'deleted');
+    const d = await git.commitFileDiff(repo, c.sha, byPath['f.txt']);
+    assert.ok(d.patch.includes('+f modificato'));
+    const [, prev] = await git.log(repo, { limit: 2 });
+    const img = await git.commitFileDiff(repo, prev.sha, { path: 'logo.png', kind: 'added' });
+    assert.ok(img.image.after.startsWith('data:image/png;base64,'));
+    assert.strictEqual(img.image.before, null);
+    const first = (await git.run(repo, ['rev-list', '--max-parents=0', 'HEAD'])).trim().split('\n')[0];
+    assert.ok((await git.commitFiles(repo, first)).files.length > 0, 'anche il primo commit ha i suoi file');
+  });
+  await t('annulla rebase', async () => {
+    await git.createBranch(repo, 'feat/e', 'main~3');
+    w('a.txt', 'E\n'); await commitAll('E');
+    assert.ok((await git.rebase(repo, 'main')).conflicts);
+    await git.rebaseAbort(repo);
+    const s = await git.status(repo);
+    assert.strictEqual(s.branch, 'feat/e'); assert.strictEqual(s.state, null);
+  });
+  await t('rinomina branch', async () => {
+    const r = await git.renameBranch(repo, 'feat/e', 'feat/e-nuovo');
+    assert.strictEqual(r.name, 'feat/e-nuovo');
+    assert.strictEqual((await git.status(repo)).branch, 'feat/e-nuovo');
+    await assert.rejects(git.renameBranch(repo, 'feat/e-nuovo', 'nome non valido'), /non è un nome/);
+  });
+
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`\n${passed} test superati${process.exitCode ? ', alcuni falliti' : ''}.`);
 })();

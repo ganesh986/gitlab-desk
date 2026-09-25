@@ -182,7 +182,20 @@ async function status(cwd) {
   const s = parseStatus(raw);
   s.hasHead = !!s.oid;
   s.state = await repoState(cwd);
+  s.conflicts = s.files.filter((f) => f.conflict).length;
+  if (s.state === 'rebasing') s.rebaseBranch = await rebaseHeadName(cwd);
+  s.rebased = s.upstream && s.ahead && s.behind ? await looksRebased(cwd, s.upstream) : false;
   return s;
+}
+
+// Branch divergente perché riscritto con un rebase: tutti i commit che ha solo il server
+// hanno un equivalente locale (stesse modifiche, commit diverso)
+async function looksRebased(cwd, upstream) {
+  try {
+    const out = await run(cwd, ['rev-list', '--right-only', '--cherry-mark', '--no-merges', `HEAD...${upstream}`]);
+    const lines = out.split('\n').filter(Boolean);
+    return lines.length > 0 && lines.every((l) => l.startsWith('='));
+  } catch { return false; }
 }
 
 // Merge o rebase in corso?
@@ -193,6 +206,57 @@ async function repoState(cwd) {
     if (fs.existsSync(path.join(gitDir, 'rebase-merge')) || fs.existsSync(path.join(gitDir, 'rebase-apply'))) return 'rebasing';
   } catch { /* ignore */ }
   return null;
+}
+
+async function gitDir(cwd) {
+  return (await run(cwd, ['rev-parse', '--absolute-git-dir'])).trim();
+}
+
+async function rebaseHeadName(cwd) {
+  try {
+    const dir = await gitDir(cwd);
+    for (const d of ['rebase-merge', 'rebase-apply']) {
+      const f = path.join(dir, d, 'head-name');
+      if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8').trim().replace(/^refs\/heads\//, '');
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+// Messaggio proposto da Git per il commit di merge (o di squash)
+async function pendingMessage(cwd) {
+  try {
+    const dir = await gitDir(cwd);
+    for (const name of ['MERGE_MSG', 'SQUASH_MSG']) {
+      const f = path.join(dir, name);
+      if (!fs.existsSync(f)) continue;
+      const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !l.startsWith('#'));
+      const summary = (lines.shift() || '').trim();
+      return { summary, description: lines.join('\n').trim(), kind: name === 'MERGE_MSG' ? 'merge' : 'squash' };
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+// File che contengono ancora i segni di conflitto (<<<<<<< ======= >>>>>>>)
+function filesWithMarkers(cwd, rels) {
+  const re = /^<{7}(?: |$)[\s\S]*?^>{7}(?: |$)/m;
+  return rels.filter((rel) => {
+    try {
+      const abs = path.join(cwd, rel);
+      const st = fs.statSync(abs);
+      if (!st.isFile() || st.size > 20 * 1024 * 1024) return false;
+      const buf = fs.readFileSync(abs);
+      return !buf.includes(0) && re.test(buf.toString('utf8'));
+    } catch { return false; }
+  });
+}
+
+function assertNoMarkers(cwd, rels) {
+  const bad = filesWithMarkers(cwd, rels);
+  if (bad.length) {
+    throw new GitError(`Questi file contengono ancora i segni di conflitto (<<<<<<< e >>>>>>>): ${bad.slice(0, 5).join(', ')}${bad.length > 5 ? '…' : ''}. Aprili nell'editor, scegli quale versione tenere e salva.`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +293,11 @@ function untrackedDiff(cwd, rel) {
 
 async function commit(cwd, { paths, summary, description, amend = false }) {
   if (!summary || !summary.trim()) throw new GitError('Scrivi un titolo per il commit.');
+  const state = await repoState(cwd);
+  if (state === 'rebasing') throw new GitError('È in corso un rebase: usa "Continua rebase" invece del commit.');
+  if (state === 'merging') return commitMerge(cwd, { paths: paths || [], summary, description });
   if (!amend && (!paths || !paths.length)) throw new GitError('Seleziona almeno un file da includere nel commit.');
+  if (paths && paths.length) assertNoMarkers(cwd, paths);
   const head = await hasHead(cwd);
   if (head) await run(cwd, ['reset', '-q']); // svuota l'indice (le modifiche restano nei file)
   if (paths && paths.length) {
@@ -239,6 +307,21 @@ async function commit(cwd, { paths, summary, description, amend = false }) {
   const args = ['commit', '-F', '-'];
   if (amend) args.push('--amend');
   await run(cwd, args, { input: message });
+  return (await run(cwd, ['rev-parse', '--short', 'HEAD'])).trim();
+}
+
+// Commit che conclude un merge: l'indice non va svuotato, altrimenti Git dimentica il merge
+async function commitMerge(cwd, { paths, summary, description }) {
+  const s = parseStatus(await run(cwd, ['status', '--porcelain=v2', '-z', '--untracked-files=all']));
+  const conflicted = s.files.filter((f) => f.conflict).map((f) => f.path);
+  const excludedConflicts = conflicted.filter((p) => !paths.includes(p));
+  if (excludedConflicts.length) {
+    throw new GitError(`Per completare il merge devi includere anche i file in conflitto: ${excludedConflicts.slice(0, 5).join(', ')}.`);
+  }
+  assertNoMarkers(cwd, paths);
+  if (paths.length) await run(cwd, ['add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: paths.join('\0') });
+  const message = description && description.trim() ? `${summary.trim()}\n\n${description.trim()}\n` : `${summary.trim()}\n`;
+  await run(cwd, ['commit', '-F', '-'], { input: message });
   return (await run(cwd, ['rev-parse', '--short', 'HEAD'])).trim();
 }
 
@@ -297,6 +380,87 @@ async function showCommit(cwd, sha) {
   return { patch: out };
 }
 
+// File modificati in un commit (per i merge: rispetto al primo genitore, come fa GitHub Desktop)
+
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+function checkSha(sha) {
+  if (!/^[0-9a-f]{4,40}$/i.test(sha)) throw new GitError('Commit non valido.');
+}
+
+async function parentOf(cwd, sha) {
+  const out = (await run(cwd, ['rev-list', '--parents', '-n', '1', sha])).trim().split(' ');
+  return { parent: out[1] || null, isMerge: out.length > 2 };
+}
+
+function parseNameStatus(raw) {
+  const t = raw.split('\0').filter((x, i, arr) => !(x === '' && i === arr.length - 1));
+  const files = [];
+  for (let i = 0; i < t.length; i++) {
+    const code = t[i];
+    if (!code) continue;
+    const letter = code[0];
+    if (letter === 'R' || letter === 'C') {
+      files.push({ path: t[i + 2], origPath: t[i + 1], kind: 'renamed' });
+      i += 2;
+    } else {
+      files.push({ path: t[i + 1], kind: { A: 'added', D: 'deleted', M: 'modified', T: 'modified' }[letter] || 'modified' });
+      i += 1;
+    }
+  }
+  return files;
+}
+
+async function commitFiles(cwd, sha) {
+  checkSha(sha);
+  const { parent, isMerge } = await parentOf(cwd, sha);
+  const out = await run(cwd, ['diff-tree', '-r', '-M', '-z', '--name-status', '--no-commit-id', parent || EMPTY_TREE, sha]);
+  return { files: parseNameStatus(out), isMerge };
+}
+
+const IMAGE_TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon', svg: 'image/svg+xml' };
+
+async function blobDataUri(cwd, rev, rel, mime) {
+  try {
+    const size = +(await run(cwd, ['cat-file', '-s', `${rev}:${rel}`])).trim();
+    if (!size || size > 8 * 1024 * 1024) return null;
+    const buf = await runBuffer(cwd, ['cat-file', 'blob', `${rev}:${rel}`]);
+    return `data:${mime};base64,${buf.toString('base64')}`;
+  } catch { return null; }
+}
+
+// Come run, ma restituisce i byte grezzi (per le immagini)
+function runBuffer(cwd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(gitBinary, args, { cwd, windowsHide: true, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+    const out = [];
+    child.stdout.on('data', (d) => out.push(d));
+    child.on('error', reject);
+    child.on('close', (code) => (code === 0 ? resolve(Buffer.concat(out)) : reject(new GitError(`git ${args[0]} non riuscito`))));
+  });
+}
+
+async function commitFileDiff(cwd, sha, file) {
+  checkSha(sha);
+  const { parent } = await parentOf(cwd, sha);
+  const ext = (file.path.split('.').pop() || '').toLowerCase();
+  if (IMAGE_TYPES[ext]) {
+    const mime = IMAGE_TYPES[ext];
+    const [before, after] = await Promise.all([
+      parent && file.kind !== 'added' ? blobDataUri(cwd, parent, file.origPath || file.path, mime) : null,
+      file.kind !== 'deleted' ? blobDataUri(cwd, sha, file.path, mime) : null,
+    ]);
+    if (before || after) return { image: { before, after } };
+  }
+  const args = ['diff', '--no-color', '--no-ext-diff', '-M', parent || EMPTY_TREE, sha, '--'];
+  if (file.origPath) args.push(file.origPath);
+  args.push(file.path);
+  const out = await run(cwd, args);
+  if (Buffer.byteLength(out) > MAX_DIFF_BYTES) return { tooLarge: true };
+  if (/^Binary files /m.test(out)) return { binary: true };
+  return { patch: out };
+}
+
 // ---------------------------------------------------------------------------
 // Branch
 
@@ -342,6 +506,157 @@ async function deleteBranch(cwd, name, force = false) {
   await run(cwd, ['branch', force ? '-D' : '-d', name]);
 }
 
+async function renameBranch(cwd, oldName, newName) {
+  const valid = await validateBranchName(cwd, newName);
+  const { local } = await branches(cwd);
+  const b = local.find((x) => x.name === oldName);
+  if (!b) throw new GitError(`Il branch ${oldName} non esiste.`);
+  await run(cwd, ['branch', '-m', oldName, valid]);
+  // Il branch sul server mantiene il vecchio nome: al prossimo push verrà pubblicato con quello nuovo
+  if (b.upstream) await run(cwd, ['branch', '--unset-upstream', valid]).catch(() => {});
+  return { name: valid, wasPublished: !!b.upstream, oldUpstream: b.upstream };
+}
+
+async function deleteRemoteBranch(cwd, name, auth) {
+  const url = await remoteUrl(cwd);
+  await run(cwd, ['push', 'origin', '--delete', name], { env: authEnv(url, auth) });
+}
+
+// ---------------------------------------------------------------------------
+// Stash (modifiche accantonate)
+
+async function stashAll(cwd, branch) {
+  const s = await status(cwd);
+  if (!s.files.length) throw new GitError('Non ci sono modifiche da accantonare.');
+  const when = new Date().toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'short' });
+  await run(cwd, ['stash', 'push', '--include-untracked', '-m', `GitLab Desk ${when}`]);
+  return s.files.length;
+}
+
+async function stashList(cwd) {
+  const out = await run(cwd, ['stash', 'list', `--format=%gd${US}%gs${US}%cI`]).catch(() => '');
+  return out.split('\n').filter(Boolean).map((line) => {
+    const [ref, subject, date] = line.split(US);
+    const m = subject.match(/^(?:WIP on|On) ([^:]+): (.*)$/);
+    return { ref, branch: m ? m[1] : null, message: m ? m[2] : subject, date };
+  });
+}
+
+function checkStashRef(ref) {
+  if (!/^stash@\{\d+\}$/.test(ref)) throw new GitError('Riferimento allo stash non valido.');
+}
+
+async function stashFiles(cwd, ref) {
+  checkStashRef(ref);
+  const out = await run(cwd, ['stash', 'show', '--name-only', '--include-untracked', ref])
+    .catch(() => run(cwd, ['stash', 'show', '--name-only', ref]).catch(() => ''));
+  return out.split('\n').filter(Boolean);
+}
+
+async function stashPop(cwd, ref) {
+  checkStashRef(ref);
+  try { await run(cwd, ['stash', 'pop', ref]); return { conflicts: false }; }
+  catch (e) {
+    const s = await status(cwd);
+    if (s.conflicts) return { conflicts: true };
+    throw e;
+  }
+}
+
+async function stashDrop(cwd, ref) {
+  checkStashRef(ref);
+  await run(cwd, ['stash', 'drop', ref]);
+}
+
+// ---------------------------------------------------------------------------
+// Confronto, merge e rebase
+
+async function compare(cwd, other) {
+  const out = (await run(cwd, ['rev-list', '--left-right', '--count', `HEAD...${other}`])).trim();
+  const [ahead, behind] = out.split(/\s+/).map(Number);
+  return { ahead, behind };
+}
+
+// Anteprima di un merge: quanti commit arrivano e se ci saranno conflitti (Git ≥ 2.38)
+async function mergePreview(cwd, branch) {
+  const { ahead, behind } = await compare(cwd, branch);
+  const result = { incoming: behind, outgoing: ahead, upToDate: behind === 0, fastForward: ahead === 0 && behind > 0, conflicts: null };
+  if (result.upToDate || result.fastForward) { result.conflicts = []; return result; }
+  try {
+    const out = await run(cwd, ['merge-tree', '--write-tree', '--name-only', '--no-messages', 'HEAD', branch], { okCodes: [1] });
+    const lines = out.split('\n').filter(Boolean);
+    result.conflicts = [...new Set(lines.slice(1))];
+  } catch { result.conflicts = null; /* Git troppo vecchio: conflitti non prevedibili */ }
+  return result;
+}
+
+async function ensureClean(cwd, what) {
+  const s = await status(cwd);
+  if (s.state) throw new GitError(`C'è già un ${s.state === 'merging' ? 'merge' : 'rebase'} in corso: completalo o annullalo prima.`);
+  if (s.files.length) {
+    const e = new GitError(`Hai ${s.files.length} file con modifiche non committate. Prima di ${what} fai commit oppure accantona le modifiche (stash).`);
+    e.code = 'DIRTY';
+    throw e;
+  }
+  return s;
+}
+
+async function merge(cwd, branch, { squash = false } = {}) {
+  await ensureClean(cwd, squash ? 'fare lo squash' : 'fare il merge');
+  const args = ['merge', '--no-edit'];
+  if (squash) args.push('--squash');
+  args.push(branch);
+  try {
+    const out = await run(cwd, args);
+    return { conflicts: false, upToDate: /Already up to date/i.test(out), squash };
+  } catch (e) {
+    const s = await status(cwd);
+    if (s.conflicts) return { conflicts: true, count: s.conflicts, squash };
+    throw e;
+  }
+}
+
+async function abortMerge(cwd) {
+  const state = await repoState(cwd);
+  if (state === 'merging') await run(cwd, ['merge', '--abort']);
+  else await run(cwd, ['reset', '--merge']); // squash con conflitti: non c'è MERGE_HEAD
+}
+
+const NO_EDITOR = { GIT_EDITOR: 'true', GIT_SEQUENCE_EDITOR: 'true' };
+
+async function rebase(cwd, onto) {
+  await ensureClean(cwd, 'fare il rebase');
+  try { await run(cwd, ['rebase', onto], { env: NO_EDITOR }); return { conflicts: false }; }
+  catch (e) {
+    const s = await status(cwd);
+    if (s.state === 'rebasing') return { conflicts: true, count: s.conflicts };
+    throw e;
+  }
+}
+
+async function rebaseContinue(cwd) {
+  const s = await status(cwd);
+  const changed = s.files.map((f) => f.path);
+  assertNoMarkers(cwd, changed);
+  if (changed.length) await run(cwd, ['add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: changed.join('\0') });
+  try {
+    await run(cwd, ['-c', 'core.editor=true', 'rebase', '--continue'], { env: NO_EDITOR });
+    return { conflicts: false, done: (await repoState(cwd)) !== 'rebasing' };
+  } catch (e) {
+    const after = await status(cwd);
+    if (after.state === 'rebasing' && after.conflicts) return { conflicts: true, count: after.conflicts };
+    if (after.state === 'rebasing' && /nothing to commit|No changes/i.test(e.stderr || '')) {
+      await run(cwd, ['rebase', '--skip'], { env: NO_EDITOR });
+      return rebaseContinue(cwd);
+    }
+    throw e;
+  }
+}
+
+async function rebaseAbort(cwd) {
+  await run(cwd, ['rebase', '--abort']);
+}
+
 // ---------------------------------------------------------------------------
 // Rete
 
@@ -366,6 +681,15 @@ async function push(cwd, auth) {
   return s.branch;
 }
 
+// Push forzato "sicuro": fallisce se nel frattempo qualcun altro ha pubblicato commit
+async function forcePush(cwd, auth) {
+  const url = await remoteUrl(cwd);
+  const s = await status(cwd);
+  if (!s.branch || !s.upstream) throw new GitError('Il branch non è pubblicato: usa il normale push.');
+  const remoteBranch = s.upstream.replace(/^origin\//, '');
+  await run(cwd, ['push', '--force-with-lease', 'origin', `HEAD:refs/heads/${remoteBranch}`], { env: authEnv(url, auth) });
+}
+
 async function clone(url, dest, auth) {
   const parent = path.dirname(dest);
   await run(parent, ['clone', '--', url, dest], { env: authEnv(url, auth) });
@@ -375,6 +699,9 @@ async function clone(url, dest, auth) {
 module.exports = {
   GitError, setGitBinary, run, authEnv, repoRoot, remoteUrl, hasHead,
   parseStatus, status, fileDiff, commit, undoLastCommit, discard,
-  log, unpushedShas, showCommit, branches, createBranch, checkout, deleteBranch, validateBranchName,
-  fetch, pull, push, clone,
+  log, unpushedShas, showCommit, commitFiles, commitFileDiff, branches, createBranch, checkout, deleteBranch, validateBranchName,
+  fetch, pull, push, forcePush, clone,
+  pendingMessage, filesWithMarkers, renameBranch, deleteRemoteBranch,
+  stashAll, stashList, stashFiles, stashPop, stashDrop,
+  compare, mergePreview, merge, abortMerge, rebase, rebaseContinue, rebaseAbort,
 };

@@ -65,9 +65,17 @@ function createWindow() {
   win.webContents.on('will-navigate', (e) => e.preventDefault());
 }
 
+// Stato ricevuto dall'interfaccia, usato per abilitare le voci e scriverne le etichette
+let menuState = {};
+
 function buildMenu() {
   const isMac = process.platform === 'darwin';
+  const st = menuState;
   const send = (cmd) => () => win && win.webContents.send('menu', cmd);
+  const repo = !!st.hasRepo;
+  const onBranch = repo && !!st.branch;
+  const busy = !!st.inProgress; // merge o rebase in corso
+  const def = st.defaultBranch || 'main';
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     ...(isMac ? [{ role: 'appMenu' }] : []),
     {
@@ -81,24 +89,67 @@ function buildMenu() {
         isMac ? { role: 'close' } : { role: 'quit', label: 'Esci' },
       ],
     },
-    { label: 'Modifica', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
+    { label: 'Modifica', submenu: [{ role: 'undo', label: 'Annulla' }, { role: 'redo', label: 'Ripeti' }, { type: 'separator' }, { role: 'cut', label: 'Taglia' }, { role: 'copy', label: 'Copia' }, { role: 'paste', label: 'Incolla' }, { role: 'selectAll', label: 'Seleziona tutto' }] },
+    {
+      label: 'Vista',
+      submenu: [
+        { label: 'Modifiche', accelerator: 'CmdOrCtrl+1', click: send('tab-changes') },
+        { label: 'Cronologia', accelerator: 'CmdOrCtrl+2', click: send('tab-history') },
+        { label: 'Merge request', accelerator: 'CmdOrCtrl+3', click: send('tab-mrs') },
+        { type: 'separator' },
+        { role: 'reload', label: 'Ricarica', accelerator: 'F5' },
+        { role: 'toggleDevTools', label: 'Strumenti sviluppatore' },
+        { type: 'separator' },
+        { role: 'resetZoom', label: 'Dimensione reale' }, { role: 'zoomIn', label: 'Ingrandisci' }, { role: 'zoomOut', label: 'Riduci' },
+      ],
+    },
     {
       label: 'Repository',
       submenu: [
-        { label: 'Fetch', accelerator: 'CmdOrCtrl+Shift+F', click: send('fetch') },
-        { label: 'Pull', accelerator: 'CmdOrCtrl+Shift+P', click: send('pull') },
-        { label: 'Push', accelerator: 'CmdOrCtrl+P', click: send('push') },
+        { label: 'Fetch', accelerator: 'CmdOrCtrl+Shift+F', enabled: repo, click: send('fetch') },
+        { label: 'Pull', accelerator: 'CmdOrCtrl+Shift+P', enabled: onBranch && !busy, click: send('pull') },
+        { label: 'Push', accelerator: 'CmdOrCtrl+P', enabled: onBranch && !busy, click: send('push') },
+        { label: 'Push forzato…', enabled: onBranch && !busy && !!st.published, click: send('force-push') },
         { type: 'separator' },
-        { label: 'Nuovo branch…', accelerator: 'CmdOrCtrl+Shift+N', click: send('new-branch') },
-        { label: 'Nuova merge request…', accelerator: 'CmdOrCtrl+M', click: send('new-mr') },
-        { type: 'separator' },
-        { label: 'Mostra nella cartella', click: send('reveal') },
-        { label: 'Apri su GitLab', click: send('open-gitlab') },
+        { label: 'Mostra nella cartella', enabled: repo, click: send('reveal') },
+        { label: 'Apri su GitLab', enabled: repo && !!st.onGitlab, click: send('open-gitlab') },
       ],
     },
-    { label: 'Vista', submenu: [{ role: 'reload', label: 'Ricarica' }, { role: 'toggleDevTools', label: 'Strumenti sviluppatore' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }] },
+    {
+      label: 'Branch',
+      submenu: [
+        { label: 'Nuovo branch…', accelerator: 'CmdOrCtrl+Shift+N', enabled: repo && !busy, click: send('new-branch') },
+        { label: 'Rinomina…', accelerator: 'CmdOrCtrl+Shift+R', enabled: onBranch && !busy, click: send('rename-branch') },
+        { label: 'Elimina…', accelerator: 'CmdOrCtrl+Shift+D', enabled: onBranch && !busy, click: send('delete-branch') },
+        { type: 'separator' },
+        { label: 'Scarta tutte le modifiche…', accelerator: 'CmdOrCtrl+Shift+Backspace', enabled: repo && !!st.hasChanges && !busy, click: send('discard-all') },
+        { label: 'Accantona tutte le modifiche (stash)', accelerator: 'CmdOrCtrl+Shift+S', enabled: repo && !!st.hasChanges && !busy, click: send('stash') },
+        { type: 'separator' },
+        { label: `Aggiorna da ${def}`, accelerator: 'CmdOrCtrl+Shift+U', enabled: onBranch && !busy && !!st.defaultBranch && !st.isDefault, click: send('update-from-default') },
+        { label: 'Confronta con un branch', accelerator: 'CmdOrCtrl+Shift+B', enabled: onBranch, click: send('compare') },
+        { label: 'Unisci nel branch attuale…', accelerator: 'CmdOrCtrl+Shift+M', enabled: onBranch && !busy, click: send('merge') },
+        { label: 'Squash e unisci nel branch attuale…', accelerator: 'CmdOrCtrl+Shift+H', enabled: onBranch && !busy, click: send('squash-merge') },
+        { label: 'Rebase del branch attuale…', accelerator: 'CmdOrCtrl+Shift+E', enabled: onBranch && !busy, click: send('rebase') },
+        { type: 'separator' },
+        { label: 'Confronta su GitLab', accelerator: 'CmdOrCtrl+Shift+C', enabled: onBranch && !!st.onGitlab && !!st.published, click: send('compare-gitlab') },
+        { label: 'Mostra il branch su GitLab', accelerator: 'CmdOrCtrl+Alt+B', enabled: onBranch && !!st.onGitlab && !!st.published, click: send('view-branch-gitlab') },
+        {
+          label: st.mrIid ? `Mostra la merge request !${st.mrIid}` : 'Crea merge request…',
+          accelerator: 'CmdOrCtrl+R',
+          enabled: onBranch && !!st.onGitlab && !st.isDefault,
+          click: send('new-mr'),
+        },
+      ],
+    },
   ]));
 }
+
+ipcMain.on('menu:state', (_e, state) => {
+  const next = state || {};
+  if (JSON.stringify(next) === JSON.stringify(menuState)) return;
+  menuState = next;
+  buildMenu();
+});
 
 // ---------------------------------------------------------------------------
 // Impostazioni
@@ -233,6 +284,9 @@ handle('git:discard', async (files) => {
 });
 handle('git:log', (opts) => git.log(requireRepo(), opts));
 handle('git:show', (sha) => git.showCommit(requireRepo(), sha));
+handle('git:commitFiles', (sha) => git.commitFiles(requireRepo(), sha));
+handle('git:commitFileDiff', ({ sha, file }) => git.commitFileDiff(requireRepo(), sha, file));
+handle('clipboard:write', (text) => { clipboard.writeText(String(text)); return true; });
 handle('git:branches', () => git.branches(requireRepo()));
 handle('git:createBranch', ({ name, from }) => git.createBranch(requireRepo(), name, from));
 handle('git:checkout', ({ name, remote }) => git.checkout(requireRepo(), name, { remote }));
@@ -255,6 +309,35 @@ handle('git:deleteBranch', async (name) => {
   }
   return true;
 });
+handle('git:renameBranch', ({ oldName, newName }) => git.renameBranch(requireRepo(), oldName, newName));
+handle('git:deleteCurrentBranch', async ({ name, fallback, remote }) => {
+  const repo = requireRepo();
+  const s = await git.status(repo);
+  if (s.files.length) throw new Error('Hai modifiche non committate: fai commit, accantonale o scartale prima di eliminare il branch.');
+  if (s.branch === name) {
+    const { local } = await git.branches(repo);
+    if (local.some((b) => b.name === fallback)) await git.checkout(repo, fallback);
+    else await git.checkout(repo, `origin/${fallback}`, { remote: true });
+  }
+  await git.deleteBranch(repo, name, true);
+  if (remote) await git.deleteRemoteBranch(repo, name, gitAuth());
+  return true;
+});
+handle('git:stash', () => git.stashAll(requireRepo()));
+handle('git:stashList', () => git.stashList(requireRepo()));
+handle('git:stashFiles', (ref) => git.stashFiles(requireRepo(), ref));
+handle('git:stashPop', (ref) => git.stashPop(requireRepo(), ref));
+handle('git:stashDrop', (ref) => git.stashDrop(requireRepo(), ref));
+handle('git:compare', (other) => git.compare(requireRepo(), other));
+handle('git:mergePreview', (branch) => git.mergePreview(requireRepo(), branch));
+handle('git:merge', ({ branch, squash }) => git.merge(requireRepo(), branch, { squash }));
+handle('git:abortMerge', () => git.abortMerge(requireRepo()));
+handle('git:rebase', (onto) => git.rebase(requireRepo(), onto));
+handle('git:rebaseContinue', () => git.rebaseContinue(requireRepo()));
+handle('git:rebaseAbort', () => git.rebaseAbort(requireRepo()));
+handle('git:pendingMessage', () => git.pendingMessage(requireRepo()));
+handle('git:forcePush', () => git.forcePush(requireRepo(), gitAuth()));
+handle('git:markers', (rels) => git.filesWithMarkers(requireRepo(), rels));
 handle('git:fetch', () => git.fetch(requireRepo(), gitAuth()));
 handle('git:pull', () => git.pull(requireRepo(), gitAuth()));
 handle('git:push', () => git.push(requireRepo(), gitAuth()));

@@ -538,3 +538,46 @@ table.diff tr.note td { color: var(--faint); font-style: italic; }
   .tb-item { min-width: 150px; }
   .route { display: none !important; }
 }
+.hint.ok { color: var(--add); }
+.compare-bar { padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--side); position: sticky; top: 0; z-index: 2; }
+.compare-bar .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pick-list { max-height: 42vh; overflow-y: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.preview-box { padding: 12px 18px; min-height: 52px; font-size: 12.5px; line-height: 1.5; }
+.preview-box .checks { gap: 8px; }
+.banner.stash { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+.banner .inline .btn { flex-shrink: 0; }
+
+/* ------------------------------------------------------------------ dettaglio commit */
+.commit-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.commit-head { padding: 12px 16px 10px; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+.commit-head h2 { margin: 0 0 6px; font-size: 15px; line-height: 1.35; }
+.commit-head .meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+.commit-head .author { color: var(--ink); font-weight: 600; }
+.commit-head .sep { color: var(--faint); }
+.commit-head .body { white-space: pre-wrap; color: var(--muted); margin: 8px 0 0; font: 12.5px/1.5 var(--ui); }
+.commit-head .body.clamped { max-height: 4.6em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 55%, transparent); mask-image: linear-gradient(#000 55%, transparent); }
+.icon-btn { border: 0; background: none; color: var(--muted); padding: 0 3px; border-radius: 4px; font-size: 13px; line-height: 1.2; }
+.icon-btn:hover { background: var(--hover); color: var(--ink); }
+.commit-split { flex: 1; display: flex; min-height: 0; }
+.commit-files { width: var(--files-width, 340px); flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; background: var(--side); }
+.commit-files-head { padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; text-align: center; flex-shrink: 0; }
+.commit-files-list { flex: 1; overflow-y: auto; outline: none; }
+.commit-files-list .row { user-select: none; cursor: pointer; }
+.commit-files-list:focus .row.selected { box-shadow: inset 2px 0 0 var(--accent); }
+.split-handle { width: 5px; margin: 0 -2px; flex-shrink: 0; cursor: col-resize; position: relative; z-index: 3; outline: none; }
+.split-handle::after { content: ""; position: absolute; top: 0; bottom: 0; left: 2px; width: 1px; background: var(--line); transition: background .12s, width .12s, left .12s; }
+.split-handle:hover::after, .split-handle:focus-visible::after, .split-handle.dragging::after { left: 1px; width: 3px; background: var(--accent); }
+.commit-diff { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+.commit-diff-head { display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 12.5px; flex-shrink: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.commit-diff-head .path { overflow: hidden; text-overflow: ellipsis; }
+.commit-diff-body { flex: 1; overflow: auto; min-height: 0; }
+.img-diff { display: flex; gap: 24px; padding: 24px; flex-wrap: wrap; justify-content: center; }
+.img-pane { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; max-width: 100%; }
+.img-pane figcaption { font-size: 12px; font-weight: 600; color: var(--muted); }
+.img-pane.before figcaption { color: var(--del); }
+.img-pane.after figcaption { color: var(--add); }
+.img-frame { padding: 8px; border: 1px solid var(--line); border-radius: 6px; background-color: #fff; background-image: linear-gradient(45deg, #e6e6e6 25%, transparent 25%), linear-gradient(-45deg, #e6e6e6 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #e6e6e6 75%), linear-gradient(-45deg, transparent 75%, #e6e6e6 75%); background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0; }
+.img-frame img { display: block; max-width: min(520px, 100%); max-height: 60vh; object-fit: contain; }
+.img-frame.empty { width: 160px; height: 120px; display: grid; place-items: center; color: var(--faint); background: var(--bg); }
+.img-pane.before .img-frame { border-color: color-mix(in srgb, var(--del) 45%, var(--line)); }
+.img-pane.after .img-frame { border-color: color-mix(in srgb, var(--add) 45%, var(--line)); }

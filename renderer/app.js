@@ -26,6 +26,10 @@ const S = {
   mrView: null,        // { kind: 'detail', iid } | { kind: 'new' }
   mrsError: null,
   me: null,
+  stashes: [],
+  compare: null,       // { branch, view: 'behind'|'ahead', counts, commits }
+  squashSource: null,
+  commitFile: null,    // file selezionato nel dettaglio del commit
 };
 
 const LABELS = {
@@ -63,11 +67,12 @@ function bindChrome() {
   document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => switchTab(t.dataset.tab)));
   setupSplitter();
   $('side-body').addEventListener('keydown', onFileListKey);
+  $('side-body').addEventListener('keydown', onHistoryKey);
 
   window.desk.on('app:focus', debounce(() => { if (S.repo) refreshStatus(); }, 300));
   window.desk.on('menu', (cmd) => {
-    const needRepo = ['fetch', 'pull', 'push', 'new-branch', 'new-mr', 'reveal', 'open-gitlab'];
-    if (needRepo.includes(cmd) && !S.repo) return toast('Apri prima un repository.');
+    if (!['add-repo', 'clone', 'settings'].includes(cmd) && !S.repo) return toast('Apri prima un repository.');
+    const gl = (path) => (S.project ? api('shell:open', `${S.project.webUrl}${path}`) : toast(S.projectError || 'Progetto GitLab non disponibile.'));
     ({
       'add-repo': addLocalRepo,
       clone: openClone,
@@ -76,7 +81,22 @@ function bindChrome() {
       pull: () => runNet('pull'),
       push: () => runNet('push'),
       'new-branch': () => openNewBranch(),
-      'new-mr': openNewMr,
+      'new-mr': () => { if (S.branchMr) { S.mrView = { kind: 'detail', iid: S.branchMr.iid }; switchTab('mrs'); } else openNewMr(); },
+      'force-push': () => forcePush(),
+      'rename-branch': openRenameBranch,
+      'delete-branch': openDeleteBranch,
+      'discard-all': () => S.status && discardFiles(S.status.files),
+      stash: stashAll,
+      'update-from-default': updateFromDefault,
+      compare: openCompare,
+      merge: () => openMerge(),
+      'squash-merge': () => openMerge({ squash: true }),
+      rebase: openRebase,
+      'compare-gitlab': () => gl(`/-/compare/${encodeURI(defaultBranch())}...${encodeURI(currentBranch())}`),
+      'view-branch-gitlab': () => gl(`/-/tree/${encodeURI(currentBranch())}`),
+      'tab-changes': () => switchTab('changes'),
+      'tab-history': () => switchTab('history'),
+      'tab-mrs': () => switchTab('mrs'),
       reveal: () => api('repo:reveal'),
       'open-gitlab': () => (S.project ? api('shell:open', S.project.webUrl) : toast(S.projectError || 'Progetto GitLab non disponibile.')),
     })[cmd]?.();
@@ -143,7 +163,7 @@ async function setRepo(info) {
   Object.assign(S, {
     repo: info, status: null, selectedFile: null, selection: new Set(), pivot: null, excluded: new Set(), draft: { summary: '', description: '' },
     history: [], historyDone: false, selectedCommit: null, project: null, projectError: null,
-    branchMr: null, mrs: [], mrView: null, mrsError: null,
+    branchMr: null, mrs: [], mrView: null, mrsError: null, stashes: [], compare: null, squashSource: null,
   });
   renderAll();
   await refreshStatus();
@@ -165,7 +185,7 @@ async function refreshStatus() {
   if (!S.repo) return;
   try {
     const prevBranch = S.status ? S.status.branch : undefined;
-    S.status = await api('git:status');
+    [S.status] = await Promise.all([api('git:status'), loadStashes()]);
     const paths = new Set(S.status.files.map((f) => f.path));
     for (const p of [...S.excluded]) if (!paths.has(p)) S.excluded.delete(p);
     if (S.selectedFile && !paths.has(S.selectedFile)) S.selectedFile = null;
@@ -173,13 +193,16 @@ async function refreshStatus() {
     if (S.pivot && !paths.has(S.pivot)) S.pivot = null;
     if (prevBranch !== undefined && prevBranch !== S.status.branch) {
       S.branchMr = null;
-      S.history = []; S.historyDone = false; S.selectedCommit = null;
+      S.history = []; S.historyDone = false; S.selectedCommit = null; S.compare = null;
       if (S.tab === 'history') loadHistory(true);
       refreshBranchMr();
     }
   } catch (e) {
     toast(e.message, { type: 'error', timeout: 0 });
   }
+  if (S.status && S.status.state === 'merging') prefillMergeMessage();
+  if (S.status && !S.status.state && S.squashSource && !S.status.files.length) S.squashSource = null;
+  if (S.compare && S.tab === 'history') loadCompare();
   renderToolbar();
   if (S.tab === 'changes') renderChanges();
   $('count-changes').textContent = S.status && S.status.files.length ? String(S.status.files.length) : '';
@@ -245,7 +268,10 @@ function renderToolbar() {
   const s = S.status;
   $('tb-repo-name').textContent = S.repo ? S.repo.name : 'Nessun repository';
   $('tb-branch').disabled = !S.repo;
-  $('tb-branch-name').textContent = !s ? '—' : s.branch || `HEAD staccato (${(s.oid || '').slice(0, 7)})`;
+  $('tb-branch-name').textContent = !s ? '—'
+    : s.state === 'rebasing' ? `rebase di ${s.rebaseBranch || '…'}`
+      : s.branch || `HEAD staccato (${(s.oid || '').slice(0, 7)})`;
+  syncMenuState();
 
   const route = $('route');
   const sync = $('tb-sync');
@@ -254,6 +280,13 @@ function renderToolbar() {
   sync.disabled = !S.repo || !S.repo.remoteUrl;
   if (!s) { sync.textContent = 'Fetch'; mrBtn.hidden = true; return; }
 
+  if (s.state) { // merge o rebase in corso: niente push/pull finché non è completato
+    sync.textContent = 'Fetch';
+    sync.dataset.action = 'fetch';
+    route.hidden = true;
+    mrBtn.hidden = true;
+    return;
+  }
   const counts = $('route-counts');
   mount(counts);
   route.classList.toggle('moving', !!(s.ahead || s.behind || (!s.upstream && s.hasHead)));
@@ -266,7 +299,8 @@ function renderToolbar() {
     if (s.ahead && s.behind) counts.appendChild(document.createTextNode(' '));
     if (s.behind) counts.appendChild(h('span', { class: 'behind', title: 'Commit da scaricare' }, `↓${s.behind}`));
     if (!s.ahead && !s.behind) counts.textContent = 'allineato';
-    if (s.behind) { sync.textContent = `Pull ↓${s.behind}`; sync.dataset.action = 'pull'; }
+    if (needsForcePush()) { sync.textContent = `Push forzato ↑${s.ahead}`; sync.dataset.action = 'force-push'; }
+    else if (s.behind) { sync.textContent = `Pull ↓${s.behind}`; sync.dataset.action = 'pull'; }
     else if (s.ahead) { sync.textContent = `Push ↑${s.ahead}`; sync.dataset.action = 'push'; }
     else { sync.textContent = 'Fetch'; sync.dataset.action = 'fetch'; }
   }
@@ -313,14 +347,12 @@ function renderChanges({ keepMain = false } = {}) {
   allBox.indeterminate = included.length > 0 && included.length < files.length;
 
   mount(side,
-    s.state && h('div', { class: 'banner warn', style: 'margin:10px' },
-      h('div', { class: 'text' },
-        h('strong', null, s.state === 'merging' ? 'Merge in corso' : 'Rebase in corso'),
-        h('span', null, 'Risolvi i file in conflitto nel tuo editor, poi fai commit.'))),
+    inProgressBanner(),
+    !s.state && stashBanner(),
     h('div', { class: 'list-head' },
       files.length > 0 && allBox,
       h('span', { class: 'grow' }, files.length ? `${files.length} file modificat${files.length === 1 ? 'o' : 'i'}` : 'Nessuna modifica'),
-      files.length > 0 && h('button', { class: 'link', onclick: () => discardFiles(files) }, 'Scarta tutto')),
+      files.length > 0 && !s.state && h('button', { class: 'link', onclick: () => discardFiles(files) }, 'Scarta tutto')),
     h('div', { class: 'file-list', role: 'listbox', 'aria-multiselectable': 'true', 'aria-label': 'File modificati' },
       files.map((f) => fileRow(f))));
 
@@ -338,14 +370,16 @@ function renderChanges({ keepMain = false } = {}) {
   });
   const canCommit = () => S.draft.summary.trim() && files.some((f) => !S.excluded.has(f.path));
   const commitBtn = h('button', { class: 'btn primary block', disabled: !canCommit(), onclick: (e) => doCommit(e.currentTarget) },
-    s.branch ? `Commit su ${s.branch}` : 'Commit');
+    s.state === 'merging' ? 'Completa il merge' : s.branch ? `Commit su ${s.branch}` : 'Commit');
 
-  mount(foot, h('div', { class: 'commit-box' },
+  if (s.state === 'rebasing') {
+    mount(foot, h('div', { class: 'commit-box' }, h('div', { class: 'hint' }, 'Durante il rebase i commit vengono ricreati da Git: risolvi i conflitti e usa "Continua rebase" qui sopra.')));
+  } else mount(foot, h('div', { class: 'commit-box' },
     onDefault && h('div', { class: 'hint warn' },
       `Sei su ${s.branch}: per una merge request serve un branch di lavoro. `,
       h('button', { class: 'link', onclick: () => openNewBranch() }, 'Crea branch')),
     summary, desc, commitBtn,
-    s.unpushed && s.unpushed.length > 0 && h('div', { class: 'hint' },
+    !s.state && s.unpushed && s.unpushed.length > 0 && h('div', { class: 'hint' },
       h('button', { class: 'link', onclick: undoCommit }, 'Annulla ultimo commit'),
       ' (non ancora pubblicato)')));
 
@@ -538,6 +572,18 @@ async function renderFileDiff(file) {
 function renderChangesOverview() {
   const s = S.status;
   const items = [];
+  if (s.state) {
+    const conflicted = s.files.filter((f) => f.conflict);
+    mount($('main'), h('div', { class: 'main-scroll' }, h('div', { class: 'empty' },
+      h('h1', null, conflicted.length ? `${conflicted.length} file in conflitto` : 'Conflitti risolti'),
+      h('p', null, conflicted.length
+        ? 'In ogni file troverai blocchi delimitati da <<<<<<< e >>>>>>>: la parte sopra ======= è la tua versione, quella sotto arriva dall\'altro branch. Tieni ciò che serve, cancella i segni e salva.'
+        : (s.state === 'merging' ? 'Controlla le modifiche e completa il merge con il pulsante in basso a sinistra.' : 'Continua il rebase dal pannello a sinistra.')),
+      conflicted.length > 0 && h('div', { class: 'actions' },
+        editorButton(conflicted.map((f) => f.path), false),
+        h('button', { class: 'btn', onclick: () => { S.selection = new Set([conflicted[0].path]); S.selectedFile = conflicted[0].path; S.pivot = conflicted[0].path; renderChanges(); } }, 'Mostra il primo')))));
+    return;
+  }
   if (s.files.length) {
     items.push(h('div', { class: 'empty' },
       h('h1', null, `${s.files.length} file con modifiche`),
@@ -578,6 +624,7 @@ async function doCommit(btn) {
   const paths = S.status.files.filter((f) => !S.excluded.has(f.path)).flatMap((f) => (f.origPath ? [f.path, f.origPath] : [f.path]));
   const ok = await busy(btn, async () => {
     const sha = await api('git:commit', { paths, summary: S.draft.summary, description: S.draft.description });
+    document.querySelectorAll('#toasts .toast.error').forEach((t) => t.remove());
     toast(`Commit ${sha} creato.`, { type: 'success' });
     return true;
   });
@@ -612,16 +659,30 @@ async function discardFiles(files) {
 
 // ------------------------------------------------------------------ rete
 
-async function syncAction(btn) { runNet(btn.dataset.action || 'fetch', btn); }
+async function syncAction(btn) {
+  if (btn.dataset.action === 'force-push') return forcePush(btn);
+  if (btn.dataset.action === 'pull' && needsForcePush()) return forcePush(btn);
+  if (S.status && S.status.state && btn.dataset.action !== 'fetch') return toast(`Completa o annulla prima il ${S.status.state === 'merging' ? 'merge' : 'rebase'} in corso.`, { type: 'error' });
+  return runNet(btn.dataset.action || 'fetch', btn);
+}
 
 async function runNet(action, btn = $('tb-sync')) {
   const labels = { fetch: 'Fetch completato.', pull: 'Pull completato: il branch è aggiornato.', push: 'Push completato.' };
+  let pullConflict = false;
   const ok = await busy(btn, async () => {
     if (action === 'pull') await api('git:fetch');
-    await api(`git:${action}`);
+    try { await api(`git:${action}`); }
+    catch (e) {
+      if (action === 'pull') {
+        const st = await api('git:status').catch(() => null);
+        if (st && st.state === 'merging' && st.conflicts) { pullConflict = true; return false; }
+      }
+      throw e;
+    }
     return true;
   });
   await refreshStatus();
+  if (pullConflict) { switchTab('changes'); toast(`Il pull ha prodotto conflitti in ${S.status.conflicts} file: risolvili e completa il merge.`, { type: 'error', timeout: 0 }); return; }
   if (!ok) return;
   S.history = [];
   if (S.tab === 'history') loadHistory(true);
@@ -642,14 +703,37 @@ async function runNet(action, btn = $('tb-sync')) {
 
 // ------------------------------------------------------------------ Cronologia
 
+function selectCommit(sha) {
+  if (S.selectedCommit !== sha) S.commitFile = null;
+  S.selectedCommit = sha;
+  renderHistory();
+  const row = document.querySelector('#side-body .commit-row.selected');
+  if (row) row.scrollIntoView({ block: 'nearest' });
+}
+
+function onHistoryKey(e) {
+  if (S.tab !== 'history' || e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  const list = S.compare ? S.compare.commits : S.history;
+  if (!list.length) return;
+  e.preventDefault();
+  const i = list.findIndex((c) => c.sha === S.selectedCommit);
+  const next = list[Math.max(0, Math.min(list.length - 1, i < 0 ? 0 : i + (e.key === 'ArrowDown' ? 1 : -1)))];
+  selectCommit(next.sha);
+}
+
 function renderHistory() {
   mount($('side-foot'));
   const unpushed = new Set((S.status && S.status.unpushed) || []);
+  const cmp = S.compare;
+  const commits = cmp ? cmp.commits : S.history;
   mount($('side-body'),
-    !S.history.length && h('div', { class: 'list-head' }, S.historyDone ? 'Nessun commit' : 'Caricamento…'),
-    S.history.map((c) => h('div', {
+    S.status && S.status.branch && compareBar(),
+    cmp && cmp.counts && !commits.length && h('div', { class: 'list-head' }, cmp.view === 'behind' ? `Nessun commit da ricevere da ${cmp.branch}.` : `Nessun commit che ${cmp.branch} non abbia già.`),
+    !cmp && !S.history.length && h('div', { class: 'list-head' }, S.historyDone ? 'Nessun commit' : 'Caricamento…'),
+    commits.map((c) => h('div', {
       class: 'commit-row row' + (S.selectedCommit === c.sha ? ' selected' : ''),
-      onclick: () => { S.selectedCommit = c.sha; renderHistory(); },
+      onclick: () => { selectCommit(c.sha); $('side-body').focus({ preventScroll: true }); },
     },
     h('div', { class: 'subject' }, c.subject),
     h('div', { class: 'meta' },
@@ -657,25 +741,167 @@ function renderHistory() {
       h('span', { title: fullDate(c.date) }, ago(c.date)),
       h('span', { class: 'sha' }, c.short),
       unpushed.has(c.sha) && h('span', { class: 'badge-local' }, 'da pubblicare')))),
-    !S.historyDone && S.history.length > 0 && h('div', { style: 'padding:10px' },
+    !cmp && !S.historyDone && S.history.length > 0 && h('div', { style: 'padding:10px' },
       h('button', { class: 'btn small block', onclick: (e) => busy(e.currentTarget, () => loadHistory(false)) }, 'Carica commit precedenti')));
 
-  const c = S.history.find((x) => x.sha === S.selectedCommit);
+  const c = commits.find((x) => x.sha === S.selectedCommit);
   if (!c) {
-    mount($('main'), h('div', { class: 'empty' }, h('h1', null, 'Cronologia del branch'), h('p', null, 'Seleziona un commit per vedere autore, messaggio e modifiche.')));
+    mount($('main'), cmp
+      ? h('div', { class: 'empty' }, h('h1', null, `Confronto con ${cmp.branch}`),
+        h('p', null, cmp.counts ? `${cmp.branch} ha ${cmp.counts.behind} commit che non hai, tu ne hai ${cmp.counts.ahead} che ${cmp.branch} non ha. Seleziona un commit per vederne le modifiche.` : 'Caricamento…'))
+      : h('div', { class: 'empty' }, h('h1', null, 'Cronologia del branch'), h('p', null, 'Seleziona un commit per vedere autore, messaggio e modifiche.')));
     return;
   }
-  const body = h('div', null, h('div', { class: 'diff-message' }, 'Caricamento…'));
-  mount($('main'), h('div', { class: 'main-scroll' },
-    h('div', { class: 'commit-detail' },
+  renderCommitView(c);
+}
+
+// ----- dettaglio di un commit: intestazione, elenco dei file e diff del file scelto
+
+const commitFilesCache = new Map();
+
+function kindBadge(kind) {
+  const letter = { added: 'A', deleted: 'D', modified: 'M', renamed: 'R', conflict: '!' }[kind] || 'M';
+  const title = { added: 'Nuovo', deleted: 'Eliminato', modified: 'Modificato', renamed: 'Rinominato', conflict: 'In conflitto' }[kind];
+  return h('span', { class: `kind ${kind}`, title }, letter);
+}
+
+function fileLabel(p) {
+  const slash = p.lastIndexOf('/');
+  return h('span', { class: 'file-name' }, h('bdi', null, h('span', { class: 'file-dir' }, slash >= 0 ? p.slice(0, slash + 1) : ''), p.slice(slash + 1)));
+}
+
+async function renderCommitView(c) {
+  const main = $('main');
+  const bodyLines = (c.body || '').split('\n');
+  const longBody = bodyLines.length > 4 || (c.body || '').length > 400;
+  const bodyEl = c.body && h('pre', { class: 'body' + (longBody ? ' clamped' : '') }, c.body);
+  const copyBtn = h('button', {
+    class: 'icon-btn', title: 'Copia l\'identificativo completo del commit', 'aria-label': 'Copia SHA',
+    onclick: async () => { await api('clipboard:write', c.sha); copyBtn.textContent = '✓'; setTimeout(() => { copyBtn.textContent = '⧉'; }, 1200); },
+  }, '⧉');
+  const filesList = h('div', { class: 'commit-files-list', tabindex: '0', role: 'listbox', 'aria-label': 'File modificati nel commit' });
+  const filesHead = h('div', { class: 'commit-files-head' }, 'Caricamento…');
+  const diffHead = h('div', { class: 'commit-diff-head' });
+  const diffBody = h('div', { class: 'commit-diff-body' });
+  const handle = h('div', { class: 'split-handle', role: 'separator', 'aria-orientation': 'vertical', tabindex: '0', title: 'Trascina per ridimensionare, doppio clic per ripristinare' });
+
+  mount(main, h('div', { class: 'commit-view' },
+    h('div', { class: 'commit-head' },
       h('h2', null, c.subject),
-      h('div', { class: 'meta' }, `${c.author} <${c.email}>, ${fullDate(c.date)} — `, h('span', { class: 'mono' }, c.sha)),
-      c.body && h('pre', { class: 'body' }, c.body),
-      S.project && h('div', { style: 'margin-top:10px' },
-        h('button', { class: 'btn small', onclick: () => api('shell:open', `${S.project.webUrl}/-/commit/${c.sha}`) }, 'Apri su GitLab'))),
-    body));
-  api('git:show', c.sha).then((d) => { if (S.selectedCommit === c.sha) mount(body, renderDiff(d)); })
-    .catch((e) => mount(body, h('div', { class: 'diff-message' }, e.message)));
+      h('div', { class: 'meta' },
+        h('span', { class: 'author', title: c.email }, c.author),
+        h('span', { class: 'sep' }, '·'),
+        h('span', { class: 'mono' }, c.short), copyBtn,
+        h('span', { class: 'sep' }, '·'),
+        h('span', { title: fullDate(c.date) }, `${fullDate(c.date)} (${ago(c.date)})`),
+        S.project && h('button', { class: 'btn small', style: 'margin-left:auto', onclick: () => api('shell:open', `${S.project.webUrl}/-/commit/${c.sha}`) }, 'Apri su GitLab')),
+      bodyEl,
+      longBody && h('button', { class: 'link', style: 'margin-top:4px', onclick: (e) => { const open = bodyEl.classList.toggle('clamped'); e.target.textContent = open ? 'Mostra tutto' : 'Mostra meno'; } }, 'Mostra tutto')),
+    h('div', { class: 'commit-split' },
+      h('div', { class: 'commit-files' }, filesHead, filesList),
+      handle,
+      h('div', { class: 'commit-diff' }, diffHead, diffBody))));
+
+  attachResizer(handle, { cssVar: '--files-width', storageKey: 'commitFilesWidth', def: 340, min: 200, max: () => Math.max(240, main.clientWidth - 320) });
+
+  let data = commitFilesCache.get(c.sha);
+  if (!data) {
+    try { data = await api('git:commitFiles', c.sha); } catch (e) { mount(filesHead, e.message); return; }
+    commitFilesCache.set(c.sha, data);
+    if (commitFilesCache.size > 50) commitFilesCache.delete(commitFilesCache.keys().next().value);
+  }
+  if (S.selectedCommit !== c.sha) return;
+  const files = data.files;
+  mount(filesHead, `${files.length} file modificat${files.length === 1 ? 'o' : 'i'}`, data.isMerge && h('span', { class: 'sub', title: 'Per i commit di merge vengono mostrate le modifiche rispetto al primo genitore' }, ' · merge'));
+  if (!files.length) { mount(diffBody, h('div', { class: 'diff-message' }, 'Questo commit non modifica nessun file.')); return; }
+  if (!files.some((f) => f.path === S.commitFile)) S.commitFile = files[0].path;
+
+  const drawList = () => mount(filesList, files.map((f) => h('div', {
+    class: 'row' + (f.path === S.commitFile ? ' selected' : ''),
+    role: 'option', 'aria-selected': String(f.path === S.commitFile),
+    title: f.origPath ? `${f.origPath} → ${f.path}` : f.path,
+    onclick: () => select(f.path),
+    oncontextmenu: (e) => { e.preventDefault(); select(f.path); api('clipboard:write', f.path).then(() => toast(`Percorso copiato: ${f.path}`)); },
+  }, fileLabel(f.path), kindBadge(f.kind))));
+
+  let token = 0;
+  const showDiff = async (f) => {
+    const my = ++token;
+    mount(diffHead, h('span', { class: 'path' }, f.origPath ? `${f.origPath} → ${f.path}` : f.path));
+    mount(diffBody, h('div', { class: 'diff-message' }, 'Caricamento…'));
+    try {
+      const d = await api('git:commitFileDiff', { sha: c.sha, file: f });
+      if (my !== token) return;
+      mount(diffBody, d.image ? renderImageDiff(d.image) : renderDiff(d, { showFileHeaders: false }));
+      diffBody.scrollTop = 0;
+    } catch (e) { if (my === token) mount(diffBody, h('div', { class: 'diff-message' }, e.message)); }
+  };
+  const select = (p) => {
+    S.commitFile = p;
+    drawList();
+    const row = filesList.querySelector('.row.selected');
+    if (row) row.scrollIntoView({ block: 'nearest' });
+    showDiff(files.find((f) => f.path === p));
+  };
+  filesList.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    e.stopPropagation();
+    const i = files.findIndex((f) => f.path === S.commitFile);
+    const next = files[Math.max(0, Math.min(files.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
+    if (next) select(next.path);
+  });
+  select(S.commitFile);
+}
+
+function renderImageDiff({ before, after }) {
+  const pane = (label, src, cls) => h('figure', { class: `img-pane ${cls}` },
+    h('figcaption', null, label),
+    src ? h('div', { class: 'img-frame' }, h('img', { src, alt: label })) : h('div', { class: 'img-frame empty' }, '—'));
+  return h('div', { class: 'img-diff' },
+    before && pane('Prima', before, 'before'),
+    pane(before ? 'Dopo' : 'Nuova immagine', after, 'after'));
+}
+
+// Divisore trascinabile generico: aggiorna una variabile CSS e ricorda la larghezza
+function attachResizer(handle, { cssVar, storageKey, def, min, max }) {
+  const root = document.documentElement;
+  const clamp = (w) => Math.round(Math.min(max(), Math.max(min, w)));
+  const read = () => { try { const v = parseInt(localStorage.getItem(storageKey), 10); return Number.isFinite(v) ? v : def; } catch { return def; } };
+  let width = clamp(read());
+  const apply = (w, save) => {
+    width = clamp(w);
+    root.style.setProperty(cssVar, `${width}px`);
+    if (save) { try { localStorage.setItem(storageKey, String(width)); } catch { /* ignora */ } }
+  };
+  apply(width, false);
+  handle.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = width;
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add('dragging');
+    document.body.classList.add('resizing');
+    const move = (ev) => apply(startW + ev.clientX - startX, false);
+    const up = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
+      handle.classList.remove('dragging');
+      document.body.classList.remove('resizing');
+      apply(width, true);
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
+  });
+  handle.addEventListener('dblclick', () => apply(def, true));
+  handle.addEventListener('keydown', (e) => {
+    const step = e.shiftKey ? 50 : 10;
+    if (e.key === 'ArrowLeft') { apply(width - step, true); e.preventDefault(); }
+    if (e.key === 'ArrowRight') { apply(width + step, true); e.preventDefault(); }
+  });
 }
 
 // ------------------------------------------------------------------ Merge request
@@ -1154,6 +1380,452 @@ function openSettings({ firstRun } = {}) {
     ],
     footer: [test, h('div', { style: 'flex:1' }), h('button', { class: 'btn', onclick: () => m.close() }, 'Annulla'), save],
   });
+}
+
+// =========================================================================== branch: merge, rebase, stash, confronto
+
+function currentBranch() { return S.status && S.status.branch; }
+function defaultBranch() { return S.project ? S.project.defaultBranch : null; }
+
+function syncMenuState() {
+  if (!window.desk.setMenuState) return;
+  const s = S.status;
+  window.desk.setMenuState({
+    hasRepo: !!S.repo,
+    branch: s ? s.branch : null,
+    defaultBranch: defaultBranch(),
+    isDefault: !!(s && S.project && s.branch === S.project.defaultBranch),
+    hasChanges: !!(s && s.files.length),
+    inProgress: !!(s && s.state),
+    published: !!(s && s.upstream),
+    onGitlab: !!S.project,
+    mrIid: S.branchMr ? S.branchMr.iid : null,
+  });
+}
+
+function requireBranch() {
+  if (!S.repo || !S.status) { toast('Apri prima un repository.'); return null; }
+  if (S.status.state) { toast(`C'è un ${S.status.state === 'merging' ? 'merge' : 'rebase'} in corso: completalo o annullalo prima.`, { type: 'error' }); return null; }
+  if (!S.status.branch) { toast('Non sei su un branch.', { type: 'error' }); return null; }
+  return S.status.branch;
+}
+
+// ----- push forzato dopo un rebase
+
+const forceKey = () => `forcePush:${S.repo && S.repo.path}:${currentBranch()}`;
+function needsForcePush() {
+  const s = S.status;
+  if (!s || !s.upstream || !s.ahead || !s.behind) return false;
+  if (s.rebased) return true;
+  try { return localStorage.getItem(forceKey()) === '1'; } catch { return false; }
+}
+function markForcePush(on) {
+  try { if (on) localStorage.setItem(forceKey(), '1'); else localStorage.removeItem(forceKey()); } catch { /* ignora */ }
+}
+
+async function forcePush(btn) {
+  const s = S.status;
+  const ok = await confirmDialog({
+    title: 'Push forzato',
+    message: `Il branch ${s.branch} sul server verrà sostituito con la tua versione locale. Serve dopo un rebase. Se nel frattempo qualcun altro ha pubblicato commit su questo branch, il push si ferma e non perdi nulla.`,
+    confirm: 'Forza il push',
+    danger: true,
+  });
+  if (!ok) return;
+  const done = await busy(btn, async () => { await api('git:forcePush'); return true; });
+  if (done) { markForcePush(false); toast('Push forzato completato.', { type: 'success' }); }
+  await refreshStatus();
+}
+
+// ----- stash
+
+async function loadStashes() {
+  S.stashes = await api('git:stashList').catch(() => []);
+}
+
+async function stashAll() {
+  if (!S.status || !S.status.files.length) return toast('Non ci sono modifiche da accantonare.');
+  const n = await busy(null, () => api('git:stash'));
+  if (n) {
+    toast(`${n} file accantonati. Li ritrovi nel pannello Modifiche, pronti da ripristinare.`, { type: 'success' });
+    S.selection = new Set(); S.selectedFile = null;
+    await refreshStatus();
+  }
+  return n;
+}
+
+function stashBanner() {
+  const b = currentBranch();
+  const list = (S.stashes || []).filter((x) => x.branch === b);
+  if (!list.length) return null;
+  const st = list[0];
+  const info = h('span', null, `Accantonate ${ago(st.date)}${list.length > 1 ? ` (+${list.length - 1} più vecchie)` : ''}.`);
+  api('git:stashFiles', st.ref).then((files) => { if (files.length) info.textContent = `${files.length} file accantonati ${ago(st.date)}${list.length > 1 ? ` (+${list.length - 1} più vecchie)` : ''}.`; }).catch(() => {});
+  return h('div', { class: 'banner stash', style: 'margin:10px' },
+    h('div', { class: 'text' }, h('strong', null, 'Modifiche accantonate'), info,
+      h('div', { class: 'inline', style: 'margin-top:8px' },
+        h('button', {
+          class: 'btn small primary',
+          onclick: (e) => busy(e.currentTarget, async () => {
+            if (S.status.files.length) {
+              const ok = await confirmDialog({ title: 'Ripristinare le modifiche?', message: 'Hai già altre modifiche in corso: Git proverà a unirle a quelle accantonate. Se toccano gli stessi file potresti dover risolvere dei conflitti.', confirm: 'Ripristina' });
+              if (!ok) return;
+            }
+            const r = await api('git:stashPop', st.ref);
+            toast(r.conflicts ? 'Modifiche ripristinate con conflitti: risolvili nei file segnati con "!".' : 'Modifiche ripristinate.', { type: r.conflicts ? 'error' : 'success', timeout: r.conflicts ? 0 : 4500 });
+            await refreshStatus();
+          }),
+        }, 'Ripristina'),
+        h('button', {
+          class: 'btn small danger',
+          onclick: async () => {
+            const ok = await confirmDialog({ title: 'Eliminare le modifiche accantonate?', message: 'Le modifiche accantonate verranno cancellate definitivamente.', confirm: 'Elimina', danger: true });
+            if (!ok) return;
+            if (await busy(null, async () => { await api('git:stashDrop', st.ref); return true; })) { toast('Modifiche accantonate eliminate.'); await refreshStatus(); }
+          },
+        }, 'Elimina'))));
+}
+
+// ----- merge o rebase in corso
+
+async function prefillMergeMessage() {
+  if (!S.status || S.draft.summary) return;
+  const m = await api('git:pendingMessage').catch(() => null);
+  if (m && m.summary && !S.draft.summary) {
+    S.draft = { summary: m.kind === 'squash' && S.squashSource ? `Unisce ${S.squashSource} (squash)` : m.summary, description: m.kind === 'squash' ? '' : m.description };
+    if (S.tab === 'changes') renderChanges({ keepMain: true });
+  }
+}
+
+function inProgressBanner() {
+  const s = S.status;
+  if (!s || !s.state) return null;
+  const conflicts = s.conflicts || 0;
+  if (s.state === 'merging') {
+    return h('div', { class: 'banner warn', style: 'margin:10px' }, h('div', { class: 'text' },
+      h('strong', null, conflicts ? `Merge in corso: ${conflicts} file in conflitto` : 'Merge in corso: conflitti risolti'),
+      h('span', null, conflicts
+        ? 'Apri i file segnati con "!", scegli quale versione tenere, salva, poi clicca "Completa il merge".'
+        : 'Controlla le modifiche e clicca "Completa il merge" per creare il commit.'),
+      h('div', { class: 'inline', style: 'margin-top:8px' },
+        conflicts > 0 && editorButton(s.files.filter((f) => f.conflict).map((f) => f.path)),
+        h('button', { class: 'btn small danger', onclick: abortInProgress }, 'Annulla merge'))));
+  }
+  return h('div', { class: 'banner warn', style: 'margin:10px' }, h('div', { class: 'text' },
+    h('strong', null, `Rebase di ${s.rebaseBranch || 'branch'} in corso${conflicts ? `: ${conflicts} file in conflitto` : ''}`),
+    h('span', null, conflicts
+      ? 'Risolvi i conflitti nei file segnati con "!", salva, poi clicca "Continua rebase".'
+      : 'Clicca "Continua rebase" per procedere con i commit successivi.'),
+    h('div', { class: 'inline', style: 'margin-top:8px' },
+      h('button', { class: 'btn small primary', onclick: (e) => continueRebase(e.currentTarget) }, 'Continua rebase'),
+      conflicts > 0 && editorButton(s.files.filter((f) => f.conflict).map((f) => f.path)),
+      h('button', { class: 'btn small danger', onclick: abortInProgress }, 'Annulla rebase'))));
+}
+
+async function abortInProgress() {
+  const what = S.status.state === 'merging' ? 'merge' : 'rebase';
+  const ok = await confirmDialog({ title: `Annullare il ${what}?`, message: `Il branch torna com'era prima del ${what}. Le risoluzioni dei conflitti fatte finora andranno perse.`, confirm: `Annulla ${what}`, danger: true });
+  if (!ok) return;
+  const done = await busy(null, async () => { await api(what === 'merge' ? 'git:abortMerge' : 'git:rebaseAbort'); return true; });
+  if (done) { S.draft = { summary: '', description: '' }; toast(`${what === 'merge' ? 'Merge' : 'Rebase'} annullato.`); await refreshStatus(); }
+}
+
+async function continueRebase(btn) {
+  const r = await busy(btn, () => api('git:rebaseContinue'));
+  if (!r) return;
+  await refreshStatus();
+  if (r.conflicts) toast(`Nuovi conflitti in ${r.count} file nel commit successivo: risolvili e continua.`, { type: 'error', timeout: 0 });
+  else afterRebaseDone();
+}
+
+function afterRebaseDone() {
+  const s = S.status;
+  if (s.upstream && s.behind) {
+    markForcePush(true);
+    toast('Rebase completato. Il branch era già pubblicato: per aggiornarlo sul server serve un push forzato.', { type: 'success', timeout: 10000, action: { label: 'Push forzato', run: () => forcePush() } });
+  } else {
+    toast('Rebase completato.', { type: 'success' });
+  }
+  renderToolbar();
+}
+
+// ----- scelta del branch con anteprima (merge, squash, rebase, confronto)
+
+async function pickBranch({ title, confirmLabel, preview, onConfirm, includeCurrent = false, initial }) {
+  const data = await busy(null, () => api('git:branches'));
+  if (!data) return;
+  const cur = currentBranch();
+  const items = [
+    ...data.local.filter((b) => includeCurrent || b.name !== cur).map((b) => ({ ref: b.name, label: b.name, date: b.date, group: 'Branch locali' })),
+    ...data.remote.map((b) => ({ ref: b.name, label: b.name, date: b.date, group: 'Sul server' })),
+  ];
+  let chosen = null;
+  const filter = h('input', { type: 'search', class: 'filter', placeholder: 'Filtra branch' });
+  const list = h('div', { class: 'pick-list' });
+  const previewBox = h('div', { class: 'preview-box' }, h('span', { class: 'sub' }, 'Scegli un branch.'));
+  const confirm = h('button', { class: 'btn primary', disabled: true, onclick: async () => { if (!chosen) return; const ok = await onConfirm(chosen, confirm); if (ok !== false) m.close(); } }, confirmLabel(null));
+  let token = 0;
+  const choose = async (it) => {
+    chosen = it.ref;
+    draw();
+    confirm.textContent = confirmLabel(chosen);
+    confirm.disabled = true;
+    mount(previewBox, h('span', { class: 'sub' }, 'Verifica in corso…'));
+    const my = ++token;
+    try {
+      const r = await preview(chosen);
+      if (my !== token) return;
+      mount(previewBox, r.node);
+      confirm.disabled = !r.enabled;
+    } catch (e) { if (my === token) mount(previewBox, h('div', { class: 'status-line err' }, e.message)); }
+  };
+  const draw = () => {
+    const q = filter.value.toLowerCase();
+    const shown = items.filter((it) => it.label.toLowerCase().includes(q));
+    let group = null;
+    mount(list, shown.flatMap((it) => {
+      const out = [];
+      if (it.group !== group) { group = it.group; out.push(h('div', { class: 'group-label' }, group)); }
+      out.push(h('div', { class: 'row' + (chosen === it.ref ? ' selected' : ''), onclick: () => choose(it) },
+        h('span', { class: 'tick' }, chosen === it.ref ? '✓' : ''), h('span', { class: 'grow mono' }, it.label), h('span', { class: 'sub' }, ago(it.date))));
+      return out;
+    }));
+    if (!shown.length) mount(list, h('div', { class: 'diff-message', style: 'padding:14px' }, 'Nessun branch trovato.'));
+  };
+  filter.addEventListener('input', draw);
+  filter.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const first = items.find((it) => it.label.toLowerCase().includes(filter.value.toLowerCase()));
+    if (first && chosen !== first.ref) choose(first); else if (!confirm.disabled) confirm.click();
+  });
+  draw();
+  const m = modal({
+    title, flush: true,
+    body: [h('div', { style: 'padding-top:4px' }, filter), list, previewBox],
+    footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Annulla'), confirm],
+    width: 'min(560px, calc(100vw - 32px))',
+  });
+  const start = initial && items.find((it) => it.ref === initial);
+  if (start) choose(start);
+}
+
+function dirtyNotice() {
+  const n = S.status.files.length;
+  if (!n) return null;
+  const box = h('div', { class: 'status-line err' }, `Hai ${n} file con modifiche non committate. Accantonale o fai commit prima di continuare. `,
+    h('button', { class: 'link', onclick: async (e) => { e.target.disabled = true; if (await stashAll()) { box.className = 'status-line ok'; box.textContent = 'Modifiche accantonate: ora puoi continuare. Selezionalo di nuovo per aggiornare l\'anteprima.'; } } }, 'Accantona le modifiche'));
+  return box;
+}
+
+function openMerge({ squash = false, initial } = {}) {
+  const cur = requireBranch();
+  if (!cur) return;
+  pickBranch({
+    title: squash ? `Squash e unisci in ${cur}` : `Unisci in ${cur}`,
+    initial: initial || (S.project && cur !== S.project.defaultBranch ? `origin/${S.project.defaultBranch}` : undefined),
+    confirmLabel: (b) => (b ? `${squash ? 'Squash e unisci' : 'Unisci'} ${b} in ${cur}` : (squash ? 'Squash e unisci' : 'Unisci')),
+    preview: async (b) => {
+      const p = await api('git:mergePreview', b);
+      const dirty = dirtyNotice();
+      if (p.upToDate) return { node: h('div', { class: 'status-line ok' }, `${cur} contiene già tutti i commit di ${b}: non c'è niente da unire.`), enabled: false };
+      const lines = [];
+      const one = p.incoming === 1;
+      lines.push(h('div', null, h('strong', null, `${p.incoming} commit`), ` di ${b} ${one ? 'verrà' : 'verranno'} ${squash ? (one ? 'aggiunto come un unico commit' : 'uniti in un unico commit') : (one ? 'unito' : 'uniti')} in ${cur}.`));
+      if (p.conflicts === null) lines.push(h('div', { class: 'sub' }, 'Non è possibile prevedere i conflitti con questa versione di Git.'));
+      else if (p.conflicts.length) {
+        lines.push(h('div', { class: 'hint warn' }, `Ci saranno conflitti in ${p.conflicts.length} file: ${p.conflicts.slice(0, 4).join(', ')}${p.conflicts.length > 4 ? '…' : ''}. Potrai risolverli nell'editor prima di completare il merge.`));
+      } else lines.push(h('div', { class: 'hint ok' }, p.fastForward && !squash ? 'Nessun conflitto: il branch avanzerà semplicemente fino a ' + b + '.' : 'Nessun conflitto previsto.'));
+      if (dirty) lines.push(dirty);
+      return { node: h('div', { class: 'checks' }, lines), enabled: true };
+    },
+    onConfirm: async (b, btn) => {
+      if (S.status.files.length) { toast('Accantona o committa prima le modifiche in corso.', { type: 'error' }); return false; }
+      if (b.startsWith('origin/')) await api('git:fetch').catch(() => {});
+      const r = await busy(btn, () => api('git:merge', { branch: b, squash }));
+      if (!r) return false;
+      if (squash) S.squashSource = b;
+      await refreshStatus();
+      switchTab('changes');
+      if (r.conflicts) toast(`Ci sono conflitti in ${r.count} file. Risolvili nei file segnati con "!" e poi completa il ${squash ? 'commit' : 'merge'}.`, { type: 'error', timeout: 0 });
+      else if (squash) {
+        const commits = await api('git:log', { limit: 50, range: `HEAD..${b}` }).catch(() => []);
+        S.draft = { summary: `Unisce ${b} (squash)`, description: commits.reverse().map((c) => `- ${c.subject}`).join('\n') };
+        renderChanges();
+        toast('Modifiche pronte: controlla il messaggio e fai commit per completare lo squash.', { type: 'success', timeout: 8000 });
+      } else toast(`${b} unito in ${cur}. Ricordati di fare push per pubblicare il risultato.`, { type: 'success', timeout: 7000, action: { label: 'Push', run: () => runNet('push') } });
+      return true;
+    },
+  });
+}
+
+function openRebase() {
+  const cur = requireBranch();
+  if (!cur) return;
+  pickBranch({
+    title: `Rebase di ${cur}`,
+    initial: S.project && cur !== S.project.defaultBranch ? `origin/${S.project.defaultBranch}` : undefined,
+    confirmLabel: (b) => (b ? `Rebase su ${b}` : 'Rebase'),
+    preview: async (b) => {
+      const c = await api('git:compare', b);
+      if (!c.behind) return { node: h('div', { class: 'status-line ok' }, `${cur} è già aggiornato rispetto a ${b}.`), enabled: false };
+      const lines = [
+        h('div', null, `${c.ahead === 1 ? 'Il tuo commit verrà riapplicato' : `I tuoi ${c.ahead} commit verranno riapplicati`} sopra ${c.behind === 1 ? 'il commit nuovo' : `i ${c.behind} commit nuovi`} di ${b}. La cronologia resta lineare, senza commit di merge.`),
+      ];
+      if (S.status.upstream) lines.push(h('div', { class: 'hint warn' }, 'Il branch è già pubblicato: dopo il rebase servirà un push forzato. Evitalo se altri colleghi lavorano su questo stesso branch.'));
+      const dirty = dirtyNotice();
+      if (dirty) lines.push(dirty);
+      return { node: h('div', { class: 'checks' }, lines), enabled: true };
+    },
+    onConfirm: async (b, btn) => {
+      if (S.status.files.length) { toast('Accantona o committa prima le modifiche in corso.', { type: 'error' }); return false; }
+      if (b.startsWith('origin/')) await api('git:fetch').catch(() => {});
+      const r = await busy(btn, () => api('git:rebase', b));
+      if (!r) return false;
+      await refreshStatus();
+      switchTab('changes');
+      if (r.conflicts) toast(`Conflitti in ${r.count} file durante il rebase: risolvili e clicca "Continua rebase".`, { type: 'error', timeout: 0 });
+      else afterRebaseDone();
+      return true;
+    },
+  });
+}
+
+async function updateFromDefault() {
+  const cur = requireBranch();
+  const def = defaultBranch();
+  if (!cur || !def) return;
+  if (cur === def) return toast(`Sei già su ${def}: usa Pull per aggiornarlo.`);
+  if (S.status.files.length) {
+    const ok = await confirmDialog({ title: 'Modifiche in corso', message: `Per aggiornare ${cur} da ${def} le modifiche non committate vanno messe da parte. Le accantono (stash)? Potrai ripristinarle subito dopo.`, confirm: 'Accantona e continua' });
+    if (!ok || !(await stashAll())) return;
+  }
+  const r = await busy($('tb-sync'), async () => { await api('git:fetch'); return api('git:merge', { branch: `origin/${def}` }); });
+  if (!r) return;
+  await refreshStatus();
+  if (r.conflicts) { switchTab('changes'); toast(`Conflitti in ${r.count} file con ${def}: risolvili e completa il merge.`, { type: 'error', timeout: 0 }); }
+  else if (r.upToDate) toast(`${cur} è già aggiornato con ${def}.`, { type: 'success' });
+  else toast(`${cur} aggiornato con le ultime modifiche di ${def}.`, { type: 'success', action: { label: 'Push', run: () => runNet('push') } });
+}
+
+// ----- rinomina ed elimina
+
+function openRenameBranch() {
+  const cur = requireBranch();
+  if (!cur) return;
+  const input = h('input', { type: 'text', value: cur });
+  const save = h('button', {
+    class: 'btn primary',
+    onclick: async () => {
+      const n = input.value.trim();
+      if (!n || n === cur) return m.close();
+      const r = await busy(save, () => api('git:renameBranch', { oldName: cur, newName: n }));
+      if (!r) return;
+      m.close();
+      toast(r.wasPublished
+        ? `Branch rinominato in ${r.name}. Sul server resta ${r.oldUpstream} con il vecchio nome: al prossimo push verrà pubblicato ${r.name}.`
+        : `Branch rinominato in ${r.name}.`, { type: 'success', timeout: r.wasPublished ? 10000 : 4500 });
+      await refreshStatus();
+    },
+  }, 'Rinomina');
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save.click(); });
+  const m = modal({
+    title: `Rinomina ${cur}`,
+    body: [
+      h('div', { class: 'field' }, h('label', null, 'Nuovo nome'), input),
+      S.status.upstream && h('div', { class: 'status-line' }, 'Il branch è pubblicato: il rinomina vale solo sul tuo computer. Se esiste una merge request aperta, resta collegata al vecchio nome.'),
+    ],
+    footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Annulla'), save],
+  });
+  setTimeout(() => input.select(), 0);
+}
+
+function openDeleteBranch() {
+  const cur = requireBranch();
+  if (!cur) return;
+  const def = defaultBranch() || 'main';
+  if (cur === def) return toast(`${def} è il branch principale del progetto: non si elimina da qui.`, { type: 'error' });
+  const remote = h('input', { type: 'checkbox' });
+  const del = h('button', {
+    class: 'btn primary danger',
+    onclick: async () => {
+      const ok = await busy(del, () => api('git:deleteCurrentBranch', { name: cur, fallback: def, remote: remote.checked }));
+      if (!ok) return;
+      m.close();
+      markForcePush(false);
+      toast(`Branch ${cur} eliminato${remote.checked ? ' anche dal server' : ''}. Ora sei su ${def}.`, { type: 'success' });
+      await refreshStatus();
+    },
+  }, 'Elimina');
+  const m = modal({
+    title: `Eliminare ${cur}?`,
+    body: [
+      h('p', { style: 'margin:0' }, `Passerai al branch ${def} e ${cur} verrà eliminato dal tuo computer.`),
+      S.status.files.length > 0 && h('div', { class: 'status-line err' }, 'Hai modifiche non committate: fai commit, accantonale o scartale prima di eliminare il branch.'),
+      S.status.upstream && h('div', { class: 'checks' }, h('label', null, remote, `Elimina anche ${S.status.upstream} dal server`)),
+      S.status.ahead > 0 && h('div', { class: 'hint warn' }, `Attenzione: ${S.status.ahead} commit non sono mai stati pubblicati e andranno persi.`),
+      !S.status.upstream && S.status.unpushed && S.status.unpushed.length > 0 && h('div', { class: 'hint warn' }, `Attenzione: il branch non è mai stato pubblicato, i suoi ${S.status.unpushed.length} commit andranno persi.`),
+    ],
+    footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Annulla'), del],
+  });
+}
+
+// ----- confronto con un altro branch (nella Cronologia)
+
+function openCompare() {
+  const cur = requireBranchLoose();
+  if (!cur) return;
+  pickBranch({
+    title: `Confronta ${cur} con…`,
+    confirmLabel: (b) => (b ? `Confronta con ${b}` : 'Confronta'),
+    preview: async (b) => {
+      const c = await api('git:compare', b);
+      return { node: h('div', null, `${cur} ha ${c.ahead} commit che ${b} non ha, e ${b} ha ${c.behind} commit che ${cur} non ha.`), enabled: true };
+    },
+    onConfirm: async (b) => { await startCompare(b); return true; },
+  });
+}
+
+function requireBranchLoose() {
+  if (!S.repo || !S.status || !S.status.branch) { toast('Apri un repository e seleziona un branch.'); return null; }
+  return S.status.branch;
+}
+
+async function startCompare(b, view) {
+  S.compare = { branch: b, view: view || 'behind', counts: null, commits: [] };
+  S.selectedCommit = null;
+  if (S.tab !== 'history') switchTab('history');
+  await loadCompare();
+}
+
+async function loadCompare() {
+  const c = S.compare;
+  if (!c) return;
+  try {
+    c.counts = await api('git:compare', c.branch);
+    if (!c.counts[c.view === 'behind' ? 'behind' : 'ahead'] && c.counts[c.view === 'behind' ? 'ahead' : 'behind']) c.view = c.view === 'behind' ? 'ahead' : 'behind';
+    c.commits = await api('git:log', { limit: 300, range: c.view === 'behind' ? `HEAD..${c.branch}` : `${c.branch}..HEAD` });
+  } catch (e) { toast(e.message, { type: 'error' }); S.compare = null; }
+  if (S.tab === 'history') renderHistory();
+}
+
+function compareBar() {
+  const c = S.compare;
+  const cur = currentBranch();
+  if (!c) {
+    return h('div', { class: 'compare-bar' }, h('button', { class: 'btn small block', onclick: openCompare }, 'Confronta con un branch…'));
+  }
+  const seg = (key, label) => h('button', { 'aria-pressed': String(c.view === key), onclick: () => { c.view = key; S.selectedCommit = null; loadCompare(); } }, label);
+  return h('div', { class: 'compare-bar' },
+    h('div', { class: 'inline' },
+      h('span', { class: 'grow mono', title: c.branch }, `${cur} ↔ ${c.branch}`),
+      h('button', { class: 'btn small', title: 'Chiudi il confronto', onclick: () => { S.compare = null; S.selectedCommit = null; renderHistory(); } }, '✕')),
+    c.counts && h('div', { class: 'segmented', style: 'padding:8px 0 0;border:0' },
+      seg('behind', `Da ricevere ↓${c.counts.behind}`),
+      seg('ahead', `Solo qui ↑${c.counts.ahead}`)),
+    c.counts && c.view === 'behind' && c.counts.behind > 0 && !S.status.state && h('button', {
+      class: 'btn small primary block', style: 'margin-top:8px',
+      onclick: () => openMerge({ initial: c.branch }),
+    }, `Unisci ${c.branch} in ${cur}…`));
 }
 
 init().catch((e) => toast(`Avvio non riuscito: ${e.message}`, { type: 'error', timeout: 0 }));

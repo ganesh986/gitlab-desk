@@ -11,6 +11,10 @@ const channels = [
   'git:branches', 'git:createBranch', 'git:checkout', 'git:deleteBranch',
   'git:fetch', 'git:pull', 'git:push', 'git:commitsBetween',
   'gl:project', 'gl:me', 'gl:searchProjects', 'gl:mrs', 'gl:mrForBranch', 'gl:mr', 'gl:branches', 'gl:members', 'gl:createMR',
+  'git:renameBranch', 'git:deleteCurrentBranch', 'git:stash', 'git:stashList', 'git:stashFiles', 'git:stashPop', 'git:stashDrop',
+  'git:compare', 'git:mergePreview', 'git:merge', 'git:abortMerge', 'git:rebase', 'git:rebaseContinue', 'git:rebaseAbort',
+  'git:commitFiles', 'git:commitFileDiff', 'clipboard:write',
+  'git:pendingMessage', 'git:forcePush', 'git:markers',
   'shell:open', 'dialog:pickFile', 'files:contextMenu', 'files:openInEditor',
 ];
 
@@ -20,5 +24,7 @@ api.on = (event, cb) => {
   if (!['app:focus', 'menu'].includes(event)) return;
   ipcRenderer.on(event, (_e, ...args) => cb(...args));
 };
+
+api.setMenuState = (state) => ipcRenderer.send('menu:state', state);
 
 contextBridge.exposeInMainWorld('desk', api);
