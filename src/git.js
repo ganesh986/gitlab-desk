@@ -78,8 +78,8 @@ function humanizeError(text, args) {
       'Hai modifiche non salvate che verrebbero sovrascritte. Fai commit oppure scartale prima di continuare.'],
     [/CONFLICT|Automatic merge failed/i,
       'Ci sono conflitti da risolvere. Apri i file indicati nelle modifiche, sistemali e poi fai commit.'],
-    [/protected branch|pre-receive hook declined/i,
-      'Il server ha rifiutato il push: il branch è protetto. Lavora su un nuovo branch e apri una merge request.'],
+    [/protected branch|pre-receive hook declined|not allowed to push/i,
+      'GitLab ha rifiutato il push: il branch è protetto e con il tuo ruolo non puoi pubblicarci direttamente. Non dipende dall\'app: chiedi a un Maintainer di abilitare il push (in GitLab: Settings → Repository → Protected branches → "Allowed to push and merge"), oppure pubblica le modifiche su un branch di lavoro e apri una merge request.'],
     [/nothing to commit/i, 'Non ci sono modifiche da includere nel commit.'],
     [/Please tell me who you are|empty ident/i,
       'Git non conosce il tuo nome e la tua email. Impostali con: git config --global user.name "Nome Cognome" e git config --global user.email "tu@azienda.it".'],
@@ -119,6 +119,19 @@ async function repoRoot(dir) {
 
 async function hasHead(cwd) {
   try { await run(cwd, ['rev-parse', '--verify', '-q', 'HEAD']); return true; } catch { return false; }
+}
+
+// Branch principale del remote (origin/HEAD), con ripiego su main o master
+async function remoteDefaultBranch(cwd) {
+  try {
+    const ref = (await run(cwd, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])).trim();
+    if (ref) return ref.replace(/^origin\//, '');
+  } catch { /* origin/HEAD non impostato */ }
+  const refs = (await run(cwd, ['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes/origin']).catch(() => '')).split('\n');
+  for (const name of ['main', 'master', 'develop']) {
+    if (refs.includes(name) || refs.includes(`origin/${name}`)) return name;
+  }
+  return null;
 }
 
 async function remoteUrl(cwd, remote = 'origin') {
@@ -181,11 +194,32 @@ async function status(cwd) {
   const raw = await run(cwd, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all']);
   const s = parseStatus(raw);
   s.hasHead = !!s.oid;
+  await normalizeUpstream(cwd, s);
   s.state = await repoState(cwd);
   s.conflicts = s.files.filter((f) => f.conflict).length;
   if (s.state === 'rebasing') s.rebaseBranch = await rebaseHeadName(cwd);
   s.rebased = s.upstream && s.ahead && s.behind ? await looksRebased(cwd, s.upstream) : false;
   return s;
+}
+
+// L'app pubblica sempre un branch sul branch del server con lo stesso nome.
+// Se Git lo collega a un branch diverso (es. feature creato da origin/main e quindi
+// collegato a origin/main), quel collegamento viene ignorato: altrimenti il push
+// finirebbe sul branch sbagliato.
+async function normalizeUpstream(cwd, s) {
+  if (!s.branch || !s.upstream) return;
+  const own = `origin/${s.branch}`;
+  if (s.upstream === own) return;
+  s.trackingOther = s.upstream;
+  s.upstream = null;
+  s.ahead = 0;
+  s.behind = 0;
+  const exists = await run(cwd, ['rev-parse', '--verify', '-q', `refs/remotes/${own}`]).then(() => true, () => false);
+  if (exists) {
+    s.upstream = own;
+    const out = (await run(cwd, ['rev-list', '--left-right', '--count', `HEAD...${own}`])).trim().split(/\s+/).map(Number);
+    [s.ahead, s.behind] = out;
+  }
 }
 
 // Branch divergente perché riscritto con un rebase: tutti i commit che ha solo il server
@@ -489,7 +523,8 @@ async function validateBranchName(cwd, name) {
 
 async function createBranch(cwd, name, from) {
   const valid = await validateBranchName(cwd, name);
-  const args = ['switch', '-c', valid];
+  // --no-track: un branch nuovo non deve mai essere collegato al branch da cui parte
+  const args = ['switch', '--no-track', '-c', valid];
   if (from) args.push(from);
   await run(cwd, args);
   return valid;
@@ -693,7 +728,10 @@ async function fetch(cwd, auth) {
 
 async function pull(cwd, auth) {
   const url = await remoteUrl(cwd);
-  await run(cwd, ['pull', '--no-rebase', '--no-edit'], { env: authEnv(url, auth) });
+  const s = await status(cwd);
+  if (!s.branch) throw new GitError('Non sei su un branch (HEAD staccato).');
+  if (!s.upstream) throw new GitError(`Il branch ${s.branch} non è ancora sul server, quindi non c'è niente da scaricare. Per portarci le novità del branch principale usa "Aggiorna da" nel menu Branch.`);
+  await run(cwd, ['pull', '--no-rebase', '--no-edit', 'origin', `refs/heads/${s.branch}`], { env: authEnv(url, auth) });
 }
 
 async function push(cwd, auth) {
@@ -701,7 +739,10 @@ async function push(cwd, auth) {
   if (!url) throw new GitError('Il repository non ha un remote "origin".');
   const s = await status(cwd);
   if (!s.branch) throw new GitError('Non sei su un branch (HEAD staccato). Crea o seleziona un branch prima del push.');
-  const args = s.upstream ? ['push', 'origin', `HEAD:refs/heads/${s.upstream.replace(/^origin\//, '')}`] : ['push', '-u', 'origin', s.branch];
+  // Sempre verso il branch del server con lo stesso nome del branch locale
+  const args = ['push'];
+  if (!s.upstream || s.trackingOther) args.push('-u');
+  args.push('origin', `refs/heads/${s.branch}:refs/heads/${s.branch}`);
   await run(cwd, args, { env: authEnv(url, auth) });
   return s.branch;
 }
@@ -711,8 +752,8 @@ async function forcePush(cwd, auth) {
   const url = await remoteUrl(cwd);
   const s = await status(cwd);
   if (!s.branch || !s.upstream) throw new GitError('Il branch non è pubblicato: usa il normale push.');
-  const remoteBranch = s.upstream.replace(/^origin\//, '');
-  await run(cwd, ['push', '--force-with-lease', 'origin', `HEAD:refs/heads/${remoteBranch}`], { env: authEnv(url, auth) });
+  const own = `refs/heads/${s.branch}`;
+  await run(cwd, ['push', `--force-with-lease=${own}:refs/remotes/origin/${s.branch}`, 'origin', `${own}:${own}`], { env: authEnv(url, auth) });
 }
 
 async function clone(url, dest, auth) {
@@ -722,7 +763,7 @@ async function clone(url, dest, auth) {
 }
 
 module.exports = {
-  GitError, setGitBinary, run, authEnv, repoRoot, remoteUrl, hasHead,
+  GitError, setGitBinary, run, authEnv, repoRoot, remoteUrl, remoteDefaultBranch, hasHead,
   parseStatus, status, fileDiff, commit, undoLastCommit, discard,
   log, unpushedShas, showCommit, commitFiles, commitFileDiff, branches, createBranch, checkout, deleteBranch, validateBranchName,
   fetch, pull, push, forcePush, clone,

@@ -6,6 +6,15 @@ Client desktop in stile GitHub Desktop per lavorare con un server GitLab azienda
 
 Funzioni principali: elenco delle modifiche con diff e spunta dei file da includere, selezione multipla (Ctrl+clic, Maiusc+clic, frecce) con menu contestuale per scartare, ignorare con .gitignore (singoli file o per estensione), includere o escludere, copiare i percorsi e aprire i file nell'editor preferito o in Esplora risorse, commit con titolo e descrizione, annulla ultimo commit, scarta modifiche, cronologia con dettaglio dei commit in stile GitHub Desktop (elenco dei file del commit, diff del file scelto, anteprima prima/dopo delle immagini), branch (crea, rinomina, cambia, elimina anche dal server, checkout di branch remoti), menu Branch in stile GitHub Desktop con merge, squash e rebase nel branch attuale (con anteprima dei commit in arrivo e dei conflitti previsti), guida alla risoluzione dei conflitti, "Aggiorna da main", confronto tra branch, stash delle modifiche (anche automatico al cambio di branch, con la scelta tra lasciarle sul branch di partenza o portarle con sé, e vista dei file accantonati) e push forzato sicuro dopo un rebase, fetch/pull/push con conteggio dei commit da pubblicare e da scaricare, clonazione dai tuoi progetti GitLab o da URL, e merge request: elenco, dettaglio con stato di pipeline e approvazioni, creazione con revisori, bozza, squash ed eliminazione del branch dopo il merge. Se il branch non è ancora pubblicato, l'app fa il push da sola prima di creare la merge request.
 
+## Due modi di lavorare
+
+Ogni repository può usare il modo che preferisce, dal menu **Repository → Modo di lavoro**:
+
+- **Con merge request**: l'app suggerisce di lavorare su un branch e di aprire una merge request verso il branch principale.
+- **Push diretto sul branch principale**: niente suggerimenti sulle merge request; da un branch di lavoro il pulsante "Unisci in main" (menu Branch, Ctrl+Maiusc+I) aggiorna main, ci unisce il branch e propone il push. Si può anche lavorare e fare push direttamente su main.
+
+In entrambi i modi tutte le funzioni restano disponibili. Se il branch principale è protetto in GitLab e il tuo ruolo non può pubblicarci, l'app lo segnala prima del push e spiega come abilitarlo.
+
 ## Requisiti
 
 - Node.js 20 o successivo (solo per avviare e compilare l'app)

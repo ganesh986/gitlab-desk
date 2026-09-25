@@ -304,6 +304,42 @@ async function t(name, fn) {
     const s = await git.status(repo);
     assert.strictEqual(s.branch, 'feat/e'); assert.strictEqual(s.state, null);
   });
+  await t('push da un branch creato da origin/main non tocca main', async () => {
+    await git.checkout(repo, 'main');
+    await git.run(repo, ['push', '-q', 'origin', 'main']);
+    await git.fetch(repo, null);
+    const mainBefore = (await git.run(repo, ['rev-parse', 'origin/main'])).trim();
+    await git.createBranch(repo, 'feat/da-origin', 'origin/main');
+    let s = await git.status(repo);
+    assert.strictEqual(s.upstream, null, 'il nuovo branch non deve essere collegato a origin/main');
+    w('x.txt', 'x\n'); await commitAll('X');
+    await git.push(repo, null);
+    await git.fetch(repo, null);
+    assert.strictEqual((await git.run(repo, ['rev-parse', 'origin/main'])).trim(), mainBefore, 'main sul server non deve cambiare');
+    s = await git.status(repo);
+    assert.strictEqual(s.upstream, 'origin/feat/da-origin');
+    assert.strictEqual(s.ahead + s.behind, 0);
+  });
+  await t('branch già collegato per errore a origin/main: push sul proprio nome', async () => {
+    const mainBefore = (await git.run(repo, ['rev-parse', 'origin/main'])).trim();
+    await git.run(repo, ['switch', '-q', '-c', 'feat/vecchio', '--track', 'origin/main']);
+    w('y.txt', 'y\n'); await commitAll('Y');
+    let s = await git.status(repo);
+    assert.strictEqual(s.trackingOther, 'origin/main');
+    assert.strictEqual(s.upstream, null);
+    await assert.rejects(git.pull(repo, null), /non è ancora sul server/);
+    await git.push(repo, null);
+    await git.fetch(repo, null);
+    assert.strictEqual((await git.run(repo, ['rev-parse', 'origin/main'])).trim(), mainBefore, 'main sul server non deve cambiare');
+    s = await git.status(repo);
+    assert.strictEqual(s.upstream, 'origin/feat/vecchio');
+    assert.ok(!s.trackingOther, 'il collegamento viene corretto');
+    await git.pull(repo, null);
+    await git.checkout(repo, 'feat/e');
+  });
+  await t('branch principale del remote', async () => {
+    assert.strictEqual(await git.remoteDefaultBranch(repo), 'main');
+  });
   await t('rinomina branch', async () => {
     const r = await git.renameBranch(repo, 'feat/e', 'feat/e-nuovo');
     assert.strictEqual(r.name, 'feat/e-nuovo');

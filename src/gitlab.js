@@ -110,6 +110,11 @@ class GitLab {
     return this.get(`/projects/${projectId}/repository/branches`, { per_page: 100, search: search || undefined });
   }
 
+  // Informazioni sul branch, compreso can_push: se l'utente attuale può fare push direttamente
+  getBranch(projectId, name) {
+    return this.get(`/projects/${projectId}/repository/branches/${encodeURIComponent(name)}`);
+  }
+
   listMergeRequests(projectId, { state = 'opened', scope, sourceBranch } = {}) {
     return this.get(`/projects/${projectId}/merge_requests`, {
       state, scope, source_branch: sourceBranch, order_by: 'updated_at', per_page: 50,

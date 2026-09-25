@@ -85,6 +85,9 @@ function bindChrome() {
       'new-branch': () => openNewBranch(),
       'new-mr': () => { if (S.branchMr) { S.mrView = { kind: 'detail', iid: S.branchMr.iid }; switchTab('mrs'); } else openNewMr(); },
       'force-push': () => forcePush(),
+      'workflow-mr': () => setWorkflow('mr'),
+      'workflow-direct': () => setWorkflow('direct'),
+      'integrate-default': integrateIntoDefault,
       'rename-branch': openRenameBranch,
       'delete-branch': openDeleteBranch,
       'discard-all': () => S.status && discardFiles(S.status.files),
@@ -166,8 +169,10 @@ async function setRepo(info) {
     repo: info, status: null, selectedFile: null, selection: new Set(), pivot: null, excluded: new Set(), draft: { summary: '', description: '' },
     history: [], historyDone: false, selectedCommit: null, project: null, projectError: null,
     branchMr: null, mrs: [], mrView: null, mrsError: null, stashes: [], compare: null, squashSource: null,
+    localDefault: null, perms: null,
   });
   renderAll();
+  S.localDefault = await api('git:defaultBranch').catch(() => null);
   await refreshStatus();
   loadProject();
   if (S.tab === 'history') loadHistory(true);
@@ -230,6 +235,12 @@ async function refreshBranchMr() {
   const b = S.status && S.status.branch;
   if (S.project && b && b !== S.project.defaultBranch && S.status.upstream) {
     S.branchMr = await api('gl:mrForBranch', b).catch(() => null);
+  }
+  // Permessi di push sul branch attuale (branch protetti)
+  S.perms = null;
+  if (S.project && b && S.status.upstream) {
+    const info = await api('gl:branchInfo', b).catch(() => null);
+    if (info && currentBranch() === b) S.perms = { branch: b, ...info };
   }
   renderToolbar();
   if (S.tab === 'changes') renderChanges();
@@ -308,7 +319,7 @@ function renderToolbar() {
   }
   $('route-end').textContent = s.upstream || 'origin';
 
-  const canMr = S.project && s.branch && s.branch !== S.project.defaultBranch;
+  const canMr = S.project && s.branch && s.branch !== S.project.defaultBranch && workflow() === 'mr';
   mrBtn.hidden = !canMr;
   mrBtn.disabled = false;
   mrBtn.textContent = S.branchMr ? `Merge request !${S.branchMr.iid}` : 'Crea merge request';
@@ -358,7 +369,8 @@ function renderChanges({ keepMain = false } = {}) {
       files.map((f) => fileRow(f))));
 
   // Box di commit
-  const onDefault = S.project && s.branch === S.project.defaultBranch;
+  const onDefault = S.project && s.branch === S.project.defaultBranch && workflow() === 'mr';
+  const blocked = pushBlocked();
   const summary = h('input', {
     type: 'text', placeholder: 'Titolo del commit (obbligatorio)', value: S.draft.summary, maxlength: 200,
     oninput: (e) => { S.draft.summary = e.target.value; commitBtn.disabled = !canCommit(); },
@@ -377,9 +389,14 @@ function renderChanges({ keepMain = false } = {}) {
   if (s.state === 'rebasing') {
     mount(foot, h('div', { class: 'commit-box' }, h('div', { class: 'hint' }, 'Durante il rebase i commit vengono ricreati da Git: risolvi i conflitti e usa "Continua rebase" qui sopra.')));
   } else mount(foot, bar, h('div', { class: 'commit-box' },
-    onDefault && h('div', { class: 'hint warn' },
+    onDefault && !blocked && h('div', { class: 'hint warn' },
       `Sei su ${s.branch}: per una merge request serve un branch di lavoro. `,
-      h('button', { class: 'link', onclick: () => openNewBranch() }, 'Crea branch')),
+      h('button', { class: 'link', onclick: () => openNewBranch() }, 'Crea branch'),
+      ' · ',
+      h('button', { class: 'link', onclick: () => setWorkflow('direct') }, 'Lavoriamo senza merge request')),
+    blocked && h('div', { class: 'hint warn' },
+      `${s.branch} è protetto: con il tuo ruolo GitLab non puoi fare push qui. `,
+      h('button', { class: 'link', onclick: () => openNewBranch() }, 'Crea un branch di lavoro')),
     summary, desc, commitBtn,
     !s.state && s.unpushed && s.unpushed.length > 0 && h('div', { class: 'hint' },
       h('button', { class: 'link', onclick: undoCommit }, 'Annulla ultimo commit'),
@@ -602,8 +619,14 @@ function renderChangesOverview() {
   }
   const banners = [];
   if (s.branch && !s.upstream && s.hasHead) {
-    banners.push(banner('accent', 'Il branch non è ancora sul server', 'Pubblicalo per condividerlo e aprire una merge request.',
-      h('button', { class: 'btn primary', onclick: (e) => runNet('push', e.currentTarget) }, 'Pubblica branch')));
+    const direct = workflow() === 'direct';
+    banners.push(banner(direct ? '' : 'accent', 'Il branch non è ancora sul server',
+      direct ? 'Pubblicalo se vuoi condividerlo con il team: per portarlo nel branch principale non è necessario.' : 'Pubblicalo per condividerlo e aprire una merge request.',
+      h('button', { class: direct ? 'btn' : 'btn primary', onclick: (e) => runNet('push', e.currentTarget) }, 'Pubblica branch')));
+  } else if (s.ahead && pushBlocked()) {
+    banners.push(banner('warn', `Non puoi fare push su ${s.branch}`,
+      `Il branch è protetto in GitLab e il tuo ruolo non può pubblicarci direttamente. Chiedi a un Maintainer di abilitarlo (Settings → Repository → Protected branches → "Allowed to push and merge"), oppure crea un branch di lavoro dai tuoi ${s.ahead} commit e apri una merge request.`,
+      h('button', { class: 'btn', onclick: () => openNewBranch() }, 'Crea branch')));
   } else if (s.ahead) {
     banners.push(banner('accent', `${s.ahead} commit da pubblicare`, `Il branch ${s.branch} ha commit che il server non ha ancora.`,
       h('button', { class: 'btn primary', onclick: (e) => runNet('push', e.currentTarget) }, 'Push')));
@@ -615,9 +638,14 @@ function renderChangesOverview() {
   if (S.branchMr) {
     banners.push(banner('', `Merge request !${S.branchMr.iid} aperta`, S.branchMr.title,
       h('button', { class: 'btn', onclick: () => { S.mrView = { kind: 'detail', iid: S.branchMr.iid }; switchTab('mrs'); } }, 'Vedi dettagli')));
-  } else if (S.project && s.branch && s.upstream && s.branch !== S.project.defaultBranch && !s.ahead) {
-    banners.push(banner('accent', 'Pronto per la revisione?', `Apri una merge request da ${s.branch} verso ${S.project.defaultBranch}.`,
-      h('button', { class: 'btn primary', onclick: openNewMr }, 'Crea merge request')));
+  } else if (workflow() === 'mr' && S.project && s.branch && s.upstream && s.branch !== S.project.defaultBranch && !s.ahead) {
+    banners.push(banner('accent', 'Pronto per la revisione?', h('span', null, `Apri una merge request da ${s.branch} verso ${S.project.defaultBranch}. `,
+      h('button', { class: 'link', onclick: () => setWorkflow('direct') }, 'Il progetto non usa merge request?')),
+    h('button', { class: 'btn primary', onclick: openNewMr }, 'Crea merge request')));
+  } else if (workflow() === 'direct' && s.branch && defaultBranch() && s.branch !== defaultBranch() && s.hasHead) {
+    banners.push(banner('accent', `Pronto per portarlo su ${defaultBranch()}?`, h('span', null, `Unisci ${s.branch} in ${defaultBranch()} e pubblica il risultato, senza merge request. `,
+      S.project && h('button', { class: 'link', onclick: () => setWorkflow('mr') }, 'Usate le merge request?')),
+    h('button', { class: 'btn primary', onclick: integrateIntoDefault }, `Unisci in ${defaultBranch()}`)));
   }
   const stash = !s.files.length && currentStash();
   if (stash) banners.unshift(stashCard(stash));
@@ -697,6 +725,10 @@ async function runNet(action, btn = $('tb-sync')) {
   if (action === 'push') {
     await refreshBranchMr();
     const b = S.status.branch;
+    if (b !== defaultBranch() && workflow() === 'direct' && defaultBranch()) {
+      toast(`Branch ${b} pubblicato.`, { type: 'success', timeout: 9000, action: { label: `Unisci in ${defaultBranch()}`, run: integrateIntoDefault } });
+      return;
+    }
     if (S.project && !S.branchMr && b !== S.project.defaultBranch) {
       toast(`Branch ${b} pubblicato.`, { type: 'success', timeout: 9000, action: { label: 'Crea merge request', run: openNewMr } });
       return;
@@ -1406,7 +1438,58 @@ function openSettings({ firstRun } = {}) {
 // =========================================================================== branch: merge, rebase, stash, confronto
 
 function currentBranch() { return S.status && S.status.branch; }
-function defaultBranch() { return S.project ? S.project.defaultBranch : null; }
+function defaultBranch() { return (S.project && S.project.defaultBranch) || S.localDefault || null; }
+
+// Modo di lavoro per repository: 'mr' (merge request) o 'direct' (push diretto sul branch principale)
+function workflow() {
+  if (!S.repo) return 'mr';
+  try { return localStorage.getItem(`workflow:${S.repo.path}`) || (S.project ? 'mr' : 'direct'); } catch { return 'mr'; }
+}
+function setWorkflow(mode) {
+  try { localStorage.setItem(`workflow:${S.repo.path}`, mode); } catch { /* ignora */ }
+  toast(mode === 'direct'
+    ? `Modo di lavoro: push diretto su ${defaultBranch() || 'branch principale'}. Le merge request restano disponibili dal menu Branch.`
+    : 'Modo di lavoro: con merge request.', { type: 'success' });
+  renderAll();
+}
+
+// Il server ha detto che su questo branch non si può fare push?
+function pushBlocked() {
+  return !!(S.perms && S.status && S.perms.branch === S.status.branch && S.perms.exists && S.perms.canPush === false);
+}
+
+// Porta il branch attuale nel branch principale: aggiorna main, unisce, poi propone il push
+async function integrateIntoDefault() {
+  const cur = requireBranch();
+  const def = defaultBranch();
+  if (!cur) return;
+  if (!def) return toast('Non riesco a capire qual è il branch principale del repository.', { type: 'error' });
+  if (cur === def) return toast(`Sei già su ${def}.`);
+  if (S.status.files.length) {
+    const ok = await confirmDialog({ title: 'Modifiche in corso', message: `Hai modifiche non committate su ${cur}. Le accantono su ${cur} (stash) prima di continuare? Le ritroverai tornando su questo branch.`, confirm: 'Accantona e continua' });
+    if (!ok || !(await stashAll())) return;
+  }
+  const ok = await confirmDialog({
+    title: `Unire ${cur} in ${def}?`,
+    message: `Passerai su ${def}, che verrà prima aggiornato dal server; poi ci verranno uniti i commit di ${cur}. Alla fine potrai controllare il risultato e fare push.`,
+    confirm: `Unisci in ${def}`,
+  });
+  if (!ok) return;
+  const r = await busy($('tb-sync'), async () => {
+    await api('git:fetch');
+    const { local } = await api('git:branches');
+    await api('git:checkout', local.some((b) => b.name === def) ? { name: def } : { name: `origin/${def}`, remote: true });
+    const st = await api('git:status');
+    if (st.behind) await api('git:pull');
+    return api('git:merge', { branch: cur });
+  }, { errorPrefix: `Non è stato possibile unire ${cur} in ${def}.` });
+  await refreshStatus();
+  if (!r) return;
+  switchTab('changes');
+  if (r.conflicts) { toast(`Conflitti in ${r.count} file: risolvili e completa il merge, poi fai push.`, { type: 'error', timeout: 0 }); return; }
+  if (r.upToDate) { toast(`${def} contiene già tutti i commit di ${cur}.`, { type: 'success' }); return; }
+  toast(`${cur} unito in ${def}. Controlla e pubblica con Push.`, { type: 'success', timeout: 10000, action: { label: 'Push', run: () => runNet('push') } });
+}
 
 function syncMenuState() {
   if (!window.desk.setMenuState) return;
@@ -1415,12 +1498,13 @@ function syncMenuState() {
     hasRepo: !!S.repo,
     branch: s ? s.branch : null,
     defaultBranch: defaultBranch(),
-    isDefault: !!(s && S.project && s.branch === S.project.defaultBranch),
+    isDefault: !!(s && s.branch && s.branch === defaultBranch()),
     hasChanges: !!(s && s.files.length),
     inProgress: !!(s && s.state),
     published: !!(s && s.upstream),
     onGitlab: !!S.project,
     mrIid: S.branchMr ? S.branchMr.iid : null,
+    workflow: workflow(),
   });
 }
 

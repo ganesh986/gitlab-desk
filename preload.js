@@ -10,7 +10,7 @@ const channels = [
   'git:status', 'git:diff', 'git:commit', 'git:undoCommit', 'git:discard', 'git:log', 'git:show',
   'git:branches', 'git:createBranch', 'git:checkout', 'git:deleteBranch',
   'git:fetch', 'git:pull', 'git:push', 'git:commitsBetween',
-  'gl:project', 'gl:me', 'gl:searchProjects', 'gl:mrs', 'gl:mrForBranch', 'gl:mr', 'gl:branches', 'gl:members', 'gl:createMR',
+  'gl:project', 'gl:branchInfo', 'git:defaultBranch', 'gl:me', 'gl:searchProjects', 'gl:mrs', 'gl:mrForBranch', 'gl:mr', 'gl:branches', 'gl:members', 'gl:createMR',
   'git:renameBranch', 'git:deleteCurrentBranch', 'git:stash', 'git:stashList', 'git:stashFiles', 'git:stashDetails', 'git:stashFileDiff', 'git:stashPop', 'git:stashDrop',
   'git:compare', 'git:mergePreview', 'git:merge', 'git:abortMerge', 'git:rebase', 'git:rebaseContinue', 'git:rebaseAbort',
   'git:commitFiles', 'git:commitFileDiff', 'clipboard:write',

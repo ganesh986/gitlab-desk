@@ -111,6 +111,15 @@ function buildMenu() {
         { label: 'Push', accelerator: 'CmdOrCtrl+P', enabled: onBranch && !busy, click: send('push') },
         { label: 'Push forzato…', enabled: onBranch && !busy && !!st.published, click: send('force-push') },
         { type: 'separator' },
+        {
+          label: 'Modo di lavoro',
+          enabled: repo,
+          submenu: [
+            { type: 'radio', label: 'Con merge request', checked: st.workflow !== 'direct', click: send('workflow-mr') },
+            { type: 'radio', label: `Push diretto su ${def}`, checked: st.workflow === 'direct', click: send('workflow-direct') },
+          ],
+        },
+        { type: 'separator' },
         { label: 'Mostra nella cartella', enabled: repo, click: send('reveal') },
         { label: 'Apri su GitLab', enabled: repo && !!st.onGitlab, click: send('open-gitlab') },
       ],
@@ -130,6 +139,8 @@ function buildMenu() {
         { label: 'Unisci nel branch attuale…', accelerator: 'CmdOrCtrl+Shift+M', enabled: onBranch && !busy, click: send('merge') },
         { label: 'Squash e unisci nel branch attuale…', accelerator: 'CmdOrCtrl+Shift+H', enabled: onBranch && !busy, click: send('squash-merge') },
         { label: 'Rebase del branch attuale…', accelerator: 'CmdOrCtrl+Shift+E', enabled: onBranch && !busy, click: send('rebase') },
+        { type: 'separator' },
+        { label: `Unisci in ${def} e pubblica…`, accelerator: 'CmdOrCtrl+Shift+I', enabled: onBranch && !busy && !st.isDefault && !!st.defaultBranch, click: send('integrate-default') },
         { type: 'separator' },
         { label: 'Confronta su GitLab', accelerator: 'CmdOrCtrl+Shift+C', enabled: onBranch && !!st.onGitlab && !!st.published, click: send('compare-gitlab') },
         { label: 'Mostra il branch su GitLab', accelerator: 'CmdOrCtrl+Alt+B', enabled: onBranch && !!st.onGitlab && !!st.published, click: send('view-branch-gitlab') },
@@ -341,6 +352,7 @@ handle('git:pendingMessage', () => git.pendingMessage(requireRepo()));
 handle('git:forcePush', () => git.forcePush(requireRepo(), gitAuth()));
 handle('git:markers', (rels) => git.filesWithMarkers(requireRepo(), rels));
 handle('git:fetch', () => git.fetch(requireRepo(), gitAuth()));
+handle('git:defaultBranch', () => git.remoteDefaultBranch(requireRepo()));
 handle('git:pull', () => git.pull(requireRepo(), gitAuth()));
 handle('git:push', () => git.push(requireRepo(), gitAuth()));
 handle('git:commitsBetween', async (target) => {
@@ -450,6 +462,16 @@ async function currentProject() {
 }
 
 handle('gl:project', () => currentProject());
+handle('gl:branchInfo', async (name) => {
+  const p = await currentProject();
+  try {
+    const b = await gitlab().getBranch(p.id, name);
+    return { exists: true, canPush: b.can_push !== false, protected: !!b.protected, developersCanPush: !!b.developers_can_push };
+  } catch (e) {
+    if (e.status === 404) return { exists: false, canPush: true, protected: false };
+    throw e;
+  }
+});
 handle('gl:me', async () => { const u = await gitlab().currentUser(); return { id: u.id, name: u.name, username: u.username }; });
 handle('gl:searchProjects', async (q) => (await gitlab().searchProjects(q)).map((p) => ({
   id: p.id, name: p.name, path: p.path_with_namespace, httpUrl: p.http_url_to_repo, sshUrl: p.ssh_url_to_repo,
