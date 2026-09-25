@@ -30,6 +30,8 @@ const S = {
   compare: null,       // { branch, view: 'behind'|'ahead', counts, commits }
   squashSource: null,
   commitFile: null,    // file selezionato nel dettaglio del commit
+  showStash: false,    // vista delle modifiche accantonate nel pannello principale
+  stashFile: null,
 };
 
 const LABELS = {
@@ -348,7 +350,6 @@ function renderChanges({ keepMain = false } = {}) {
 
   mount(side,
     inProgressBanner(),
-    !s.state && stashBanner(),
     h('div', { class: 'list-head' },
       files.length > 0 && allBox,
       h('span', { class: 'grow' }, files.length ? `${files.length} file modificat${files.length === 1 ? 'o' : 'i'}` : 'Nessuna modifica'),
@@ -372,9 +373,10 @@ function renderChanges({ keepMain = false } = {}) {
   const commitBtn = h('button', { class: 'btn primary block', disabled: !canCommit(), onclick: (e) => doCommit(e.currentTarget) },
     s.state === 'merging' ? 'Completa il merge' : s.branch ? `Commit su ${s.branch}` : 'Commit');
 
+  const bar = !s.state && stashBar();
   if (s.state === 'rebasing') {
     mount(foot, h('div', { class: 'commit-box' }, h('div', { class: 'hint' }, 'Durante il rebase i commit vengono ricreati da Git: risolvi i conflitti e usa "Continua rebase" qui sopra.')));
-  } else mount(foot, h('div', { class: 'commit-box' },
+  } else mount(foot, bar, h('div', { class: 'commit-box' },
     onDefault && h('div', { class: 'hint warn' },
       `Sei su ${s.branch}: per una merge request serve un branch di lavoro. `,
       h('button', { class: 'link', onclick: () => openNewBranch() }, 'Crea branch')),
@@ -385,6 +387,9 @@ function renderChanges({ keepMain = false } = {}) {
 
   // Pannello principale
   if (keepMain) return;
+  const stash = currentStash();
+  if (S.showStash && stash && !s.state) { renderStashView(stash); return; }
+  S.showStash = false;
   const selected = files.filter((f) => S.selection.has(f.path));
   if (selected.length === 1) renderFileDiff(selected[0]);
   else if (selected.length > 1) renderMultiSelection(selected);
@@ -408,6 +413,7 @@ function selectFile(p, { shift = false, toggle = false } = {}) {
     S.pivot = p;
   }
   S.selectedFile = p;
+  S.showStash = false;
   renderChanges();
 }
 
@@ -613,6 +619,8 @@ function renderChangesOverview() {
     banners.push(banner('accent', 'Pronto per la revisione?', `Apri una merge request da ${s.branch} verso ${S.project.defaultBranch}.`,
       h('button', { class: 'btn primary', onclick: openNewMr }, 'Crea merge request')));
   }
+  const stash = !s.files.length && currentStash();
+  if (stash) banners.unshift(stashCard(stash));
   mount($('main'), h('div', { class: 'main-scroll' }, banners, items));
 }
 
@@ -770,6 +778,62 @@ function fileLabel(p) {
   return h('span', { class: 'file-name' }, h('bdi', null, h('span', { class: 'file-dir' }, slash >= 0 ? p.slice(0, slash + 1) : ''), p.slice(slash + 1)));
 }
 
+// Elenco di file a sinistra e diff del file scelto a destra (usato da cronologia e stash)
+function filesDiffSplit({ files, headText, getDiff, selected, onSelect, storageKey = 'commitFilesWidth' }) {
+  const filesList = h('div', { class: 'commit-files-list', tabindex: '0', role: 'listbox', 'aria-label': 'File modificati' });
+  const diffHead = h('div', { class: 'commit-diff-head' });
+  const diffBody = h('div', { class: 'commit-diff-body' });
+  const handle = h('div', { class: 'split-handle', role: 'separator', 'aria-orientation': 'vertical', tabindex: '0', title: 'Trascina per ridimensionare, doppio clic per ripristinare' });
+  const el = h('div', { class: 'commit-split' },
+    h('div', { class: 'commit-files' }, h('div', { class: 'commit-files-head' }, headText), filesList),
+    handle,
+    h('div', { class: 'commit-diff' }, diffHead, diffBody));
+  let current = files.some((f) => f.path === selected) ? selected : (files[0] && files[0].path);
+  let token = 0;
+
+  const drawList = () => mount(filesList, files.map((f) => h('div', {
+    class: 'row' + (f.path === current ? ' selected' : ''),
+    role: 'option', 'aria-selected': String(f.path === current),
+    title: f.origPath ? `${f.origPath} → ${f.path}` : f.path,
+    onclick: () => select(f.path),
+    oncontextmenu: (e) => { e.preventDefault(); select(f.path); api('clipboard:write', f.path).then(() => toast(`Percorso copiato: ${f.path}`)); },
+  }, fileLabel(f.path), kindBadge(f.kind))));
+
+  const showDiff = async (f) => {
+    const my = ++token;
+    mount(diffHead, h('span', { class: 'path' }, f.origPath ? `${f.origPath} → ${f.path}` : f.path));
+    mount(diffBody, h('div', { class: 'diff-message' }, 'Caricamento…'));
+    try {
+      const d = await getDiff(f);
+      if (my !== token) return;
+      mount(diffBody, d.image ? renderImageDiff(d.image) : renderDiff(d, { showFileHeaders: false }));
+      diffBody.scrollTop = 0;
+    } catch (e) { if (my === token) mount(diffBody, h('div', { class: 'diff-message' }, e.message)); }
+  };
+  const select = (p) => {
+    current = p;
+    if (onSelect) onSelect(p);
+    drawList();
+    const row = filesList.querySelector('.row.selected');
+    if (row) row.scrollIntoView({ block: 'nearest' });
+    showDiff(files.find((f) => f.path === p));
+  };
+  filesList.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    e.stopPropagation();
+    const i = files.findIndex((f) => f.path === current);
+    const next = files[Math.max(0, Math.min(files.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
+    if (next) select(next.path);
+  });
+  const start = (container) => {
+    attachResizer(handle, { cssVar: '--files-width', storageKey, def: 340, min: 200, max: () => Math.max(240, container.clientWidth - 320) });
+    if (!files.length) { mount(diffBody, h('div', { class: 'diff-message' }, 'Nessun file modificato.')); return; }
+    select(current);
+  };
+  return { el, start };
+}
+
 async function renderCommitView(c) {
   const main = $('main');
   const bodyLines = (c.body || '').split('\n');
@@ -779,11 +843,7 @@ async function renderCommitView(c) {
     class: 'icon-btn', title: 'Copia l\'identificativo completo del commit', 'aria-label': 'Copia SHA',
     onclick: async () => { await api('clipboard:write', c.sha); copyBtn.textContent = '✓'; setTimeout(() => { copyBtn.textContent = '⧉'; }, 1200); },
   }, '⧉');
-  const filesList = h('div', { class: 'commit-files-list', tabindex: '0', role: 'listbox', 'aria-label': 'File modificati nel commit' });
-  const filesHead = h('div', { class: 'commit-files-head' }, 'Caricamento…');
-  const diffHead = h('div', { class: 'commit-diff-head' });
-  const diffBody = h('div', { class: 'commit-diff-body' });
-  const handle = h('div', { class: 'split-handle', role: 'separator', 'aria-orientation': 'vertical', tabindex: '0', title: 'Trascina per ridimensionare, doppio clic per ripristinare' });
+  const splitSlot = h('div', { class: 'commit-split' }, h('div', { class: 'diff-message', style: 'flex:1' }, 'Caricamento…'));
 
   mount(main, h('div', { class: 'commit-view' },
     h('div', { class: 'commit-head' },
@@ -797,61 +857,25 @@ async function renderCommitView(c) {
         S.project && h('button', { class: 'btn small', style: 'margin-left:auto', onclick: () => api('shell:open', `${S.project.webUrl}/-/commit/${c.sha}`) }, 'Apri su GitLab')),
       bodyEl,
       longBody && h('button', { class: 'link', style: 'margin-top:4px', onclick: (e) => { const open = bodyEl.classList.toggle('clamped'); e.target.textContent = open ? 'Mostra tutto' : 'Mostra meno'; } }, 'Mostra tutto')),
-    h('div', { class: 'commit-split' },
-      h('div', { class: 'commit-files' }, filesHead, filesList),
-      handle,
-      h('div', { class: 'commit-diff' }, diffHead, diffBody))));
-
-  attachResizer(handle, { cssVar: '--files-width', storageKey: 'commitFilesWidth', def: 340, min: 200, max: () => Math.max(240, main.clientWidth - 320) });
+    splitSlot));
 
   let data = commitFilesCache.get(c.sha);
   if (!data) {
-    try { data = await api('git:commitFiles', c.sha); } catch (e) { mount(filesHead, e.message); return; }
+    try { data = await api('git:commitFiles', c.sha); } catch (e) { mount(splitSlot, h('div', { class: 'diff-message', style: 'flex:1' }, e.message)); return; }
     commitFilesCache.set(c.sha, data);
     if (commitFilesCache.size > 50) commitFilesCache.delete(commitFilesCache.keys().next().value);
   }
   if (S.selectedCommit !== c.sha) return;
-  const files = data.files;
-  mount(filesHead, `${files.length} file modificat${files.length === 1 ? 'o' : 'i'}`, data.isMerge && h('span', { class: 'sub', title: 'Per i commit di merge vengono mostrate le modifiche rispetto al primo genitore' }, ' · merge'));
-  if (!files.length) { mount(diffBody, h('div', { class: 'diff-message' }, 'Questo commit non modifica nessun file.')); return; }
-  if (!files.some((f) => f.path === S.commitFile)) S.commitFile = files[0].path;
-
-  const drawList = () => mount(filesList, files.map((f) => h('div', {
-    class: 'row' + (f.path === S.commitFile ? ' selected' : ''),
-    role: 'option', 'aria-selected': String(f.path === S.commitFile),
-    title: f.origPath ? `${f.origPath} → ${f.path}` : f.path,
-    onclick: () => select(f.path),
-    oncontextmenu: (e) => { e.preventDefault(); select(f.path); api('clipboard:write', f.path).then(() => toast(`Percorso copiato: ${f.path}`)); },
-  }, fileLabel(f.path), kindBadge(f.kind))));
-
-  let token = 0;
-  const showDiff = async (f) => {
-    const my = ++token;
-    mount(diffHead, h('span', { class: 'path' }, f.origPath ? `${f.origPath} → ${f.path}` : f.path));
-    mount(diffBody, h('div', { class: 'diff-message' }, 'Caricamento…'));
-    try {
-      const d = await api('git:commitFileDiff', { sha: c.sha, file: f });
-      if (my !== token) return;
-      mount(diffBody, d.image ? renderImageDiff(d.image) : renderDiff(d, { showFileHeaders: false }));
-      diffBody.scrollTop = 0;
-    } catch (e) { if (my === token) mount(diffBody, h('div', { class: 'diff-message' }, e.message)); }
-  };
-  const select = (p) => {
-    S.commitFile = p;
-    drawList();
-    const row = filesList.querySelector('.row.selected');
-    if (row) row.scrollIntoView({ block: 'nearest' });
-    showDiff(files.find((f) => f.path === p));
-  };
-  filesList.addEventListener('keydown', (e) => {
-    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-    e.preventDefault();
-    e.stopPropagation();
-    const i = files.findIndex((f) => f.path === S.commitFile);
-    const next = files[Math.max(0, Math.min(files.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
-    if (next) select(next.path);
+  const n = data.files.length;
+  const split = filesDiffSplit({
+    files: data.files,
+    headText: [`${n} file modificat${n === 1 ? 'o' : 'i'}`, data.isMerge && h('span', { class: 'sub', title: 'Per i commit di merge vengono mostrate le modifiche rispetto al primo genitore' }, ' · merge')],
+    selected: S.commitFile,
+    onSelect: (p) => { S.commitFile = p; },
+    getDiff: (f) => api('git:commitFileDiff', { sha: c.sha, file: f }),
   });
-  select(S.commitFile);
+  splitSlot.replaceWith(split.el);
+  split.start(main);
 }
 
 function renderImageDiff({ before, after }) {
@@ -970,12 +994,10 @@ async function renderMrDetail(iid) {
       pipe && pipe.web_url && h('button', { class: 'btn', onclick: () => api('shell:open', pipe.web_url) }, 'Apri pipeline'),
       mr.state === 'opened' && !onBranch && h('button', {
         class: 'btn',
-        onclick: (e) => busy(e.currentTarget, async () => {
-          await api('git:fetch');
-          await api('git:checkout', { name: `origin/${mr.source_branch}`, remote: true });
-          toast(`Ora sei sul branch ${mr.source_branch}.`, { type: 'success' });
-          await refreshStatus();
-        }),
+        onclick: async (e) => {
+          const ok = await busy(e.currentTarget, async () => { await api('git:fetch'); return true; });
+          if (ok) switchBranch(`origin/${mr.source_branch}`, { remote: true });
+        },
       }, 'Passa a questo branch')))));
 }
 
@@ -1165,8 +1187,7 @@ async function openBranchPicker(anchor) {
   const list = h('div');
   const go = async (name, remote) => {
     m.close();
-    const r = await busy(null, () => api('git:checkout', { name, remote }));
-    if (r) { toast(`Ora sei sul branch ${r}.`, { type: 'success' }); refreshStatus(); }
+    switchBranch(name, { remote });
   };
   const draw = () => {
     const q = filter.value.toLowerCase();
@@ -1452,38 +1473,6 @@ async function stashAll() {
     await refreshStatus();
   }
   return n;
-}
-
-function stashBanner() {
-  const b = currentBranch();
-  const list = (S.stashes || []).filter((x) => x.branch === b);
-  if (!list.length) return null;
-  const st = list[0];
-  const info = h('span', null, `Accantonate ${ago(st.date)}${list.length > 1 ? ` (+${list.length - 1} più vecchie)` : ''}.`);
-  api('git:stashFiles', st.ref).then((files) => { if (files.length) info.textContent = `${files.length} file accantonati ${ago(st.date)}${list.length > 1 ? ` (+${list.length - 1} più vecchie)` : ''}.`; }).catch(() => {});
-  return h('div', { class: 'banner stash', style: 'margin:10px' },
-    h('div', { class: 'text' }, h('strong', null, 'Modifiche accantonate'), info,
-      h('div', { class: 'inline', style: 'margin-top:8px' },
-        h('button', {
-          class: 'btn small primary',
-          onclick: (e) => busy(e.currentTarget, async () => {
-            if (S.status.files.length) {
-              const ok = await confirmDialog({ title: 'Ripristinare le modifiche?', message: 'Hai già altre modifiche in corso: Git proverà a unirle a quelle accantonate. Se toccano gli stessi file potresti dover risolvere dei conflitti.', confirm: 'Ripristina' });
-              if (!ok) return;
-            }
-            const r = await api('git:stashPop', st.ref);
-            toast(r.conflicts ? 'Modifiche ripristinate con conflitti: risolvili nei file segnati con "!".' : 'Modifiche ripristinate.', { type: r.conflicts ? 'error' : 'success', timeout: r.conflicts ? 0 : 4500 });
-            await refreshStatus();
-          }),
-        }, 'Ripristina'),
-        h('button', {
-          class: 'btn small danger',
-          onclick: async () => {
-            const ok = await confirmDialog({ title: 'Eliminare le modifiche accantonate?', message: 'Le modifiche accantonate verranno cancellate definitivamente.', confirm: 'Elimina', danger: true });
-            if (!ok) return;
-            if (await busy(null, async () => { await api('git:stashDrop', st.ref); return true; })) { toast('Modifiche accantonate eliminate.'); await refreshStatus(); }
-          },
-        }, 'Elimina'))));
 }
 
 // ----- merge o rebase in corso
@@ -1826,6 +1815,177 @@ function compareBar() {
       class: 'btn small primary block', style: 'margin-top:8px',
       onclick: () => openMerge({ initial: c.branch }),
     }, `Unisci ${c.branch} in ${cur}…`));
+}
+
+
+// =========================================================================== cambio branch e modifiche accantonate
+
+function stashesForBranch(b = currentBranch()) {
+  return (S.stashes || []).filter((x) => x.branch === b);
+}
+function currentStash() { return stashesForBranch()[0] || null; }
+
+const stashDetailsCache = new Map();
+async function stashDetails(st) {
+  if (!stashDetailsCache.has(st.sha)) stashDetailsCache.set(st.sha, await api('git:stashDetails', st.sha));
+  return stashDetailsCache.get(st.sha);
+}
+
+// Chiede cosa fare delle modifiche in corso prima di cambiare branch
+function askSwitchChoice(from, to, count) {
+  return new Promise((resolve) => {
+    let choice = 'leave';
+    let result = null;
+    const option = (value, title, text) => h('label', { class: 'choice' + (choice === value ? ' checked' : '') },
+      h('input', { type: 'radio', name: 'switch-choice', value, checked: choice === value, onchange: () => { choice = value; box.querySelectorAll('.choice').forEach((c) => c.classList.toggle('checked', c.querySelector('input').checked)); } }),
+      h('span', null, h('strong', null, title), h('span', { class: 'sub' }, text)));
+    const box = h('div', { class: 'choices' },
+      option('leave', `Lascia le modifiche su ${from}`, 'Vengono accantonate su questo branch: le ritrovi quando ci torni.'),
+      option('bring', `Porta le modifiche su ${to}`, 'Le modifiche in corso ti seguono sul nuovo branch.'));
+    const go = h('button', { class: 'btn primary', onclick: () => { result = choice; m.close(); } }, 'Cambia branch');
+    const m = modal({
+      title: 'Cambia branch',
+      body: [h('p', { style: 'margin:0' }, `Hai ${count === 1 ? 'un file modificato' : `${count} file modificati`} su ${from}. Cosa vuoi farne?`), box],
+      footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Annulla'), go],
+      onClose: () => resolve(result),
+    });
+    setTimeout(() => go.focus(), 0);
+  });
+}
+
+async function switchBranch(name, { remote = false } = {}) {
+  const s = S.status;
+  if (!s) return;
+  if (s.state) return toast(`Completa o annulla prima il ${s.state === 'merging' ? 'merge' : 'rebase'} in corso.`, { type: 'error' });
+  const target = remote ? name.replace(/^[^/]+\//, '') : name;
+  if (target === s.branch) return;
+  let choice = null;
+  if (s.files.length && s.branch) {
+    choice = await askSwitchChoice(s.branch, target, s.files.length);
+    if (!choice) return;
+  }
+  const from = s.branch;
+  let stashed = false;
+  const r = await busy($('tb-sync'), async () => {
+    if (choice === 'leave') { await api('git:stash'); stashed = true; }
+    try {
+      return await api('git:checkout', { name, remote });
+    } catch (e) {
+      if (stashed) {
+        // il cambio non è riuscito: rimetto le modifiche dov'erano
+        const [st] = await api('git:stashList').catch(() => []);
+        if (st && st.branch === from) await api('git:stashPop', st.ref).catch(() => {});
+      }
+      if (choice === 'bring' && /sovrascritte|overwritten/i.test(e.message)) {
+        throw new Error(`Alcune modifiche toccano file che su ${target} sono diversi, quindi non possono essere portate sul nuovo branch. Riprova scegliendo "Lascia le modifiche su ${from}".`);
+      }
+      throw e;
+    }
+  });
+  if (!r) { await refreshStatus(); return; }
+  S.selection = new Set(); S.selectedFile = null; S.showStash = false;
+  await refreshStatus();
+  const waiting = currentStash();
+  if (waiting) {
+    toast(`Ora sei su ${r}. Qui hai delle modifiche accantonate.`, { type: 'success', timeout: 8000, action: { label: 'Visualizza', run: () => openStashView() } });
+  } else {
+    toast(stashed ? `Ora sei su ${r}. Le modifiche sono rimaste accantonate su ${from}.` : `Ora sei sul branch ${r}.`, { type: 'success' });
+  }
+}
+
+function openStashView() {
+  if (!currentStash()) return;
+  S.showStash = true;
+  S.selection = new Set(); S.selectedFile = null;
+  if (S.tab !== 'changes') switchTab('changes'); else renderChanges();
+}
+
+function stashBar() {
+  const list = stashesForBranch();
+  if (!list.length) return null;
+  return h('button', {
+    class: 'stash-bar' + (S.showStash ? ' active' : ''),
+    title: 'Mostra le modifiche accantonate su questo branch',
+    onclick: () => { if (S.showStash) { S.showStash = false; renderChanges(); } else openStashView(); },
+  },
+  h('svg', { viewBox: '0 0 16 16', width: '15', height: '15', 'aria-hidden': 'true' },
+    h('path', { fill: 'currentColor', d: 'M2 3.5A1.5 1.5 0 013.5 2h9A1.5 1.5 0 0114 3.5v2a.5.5 0 01-.5.5H13v6.5a1.5 1.5 0 01-1.5 1.5h-7A1.5 1.5 0 013 12.5V6h-.5a.5.5 0 01-.5-.5v-2zM4 6v6.5a.5.5 0 00.5.5h7a.5.5 0 00.5-.5V6H4zm2 1.5h4v1H6v-1zM3.5 3a.5.5 0 00-.5.5V5h10V3.5a.5.5 0 00-.5-.5h-9z' })),
+  h('span', { class: 'grow' }, 'Modifiche accantonate'),
+  list.length > 1 && h('span', { class: 'count' }, String(list.length)),
+  h('span', { class: 'chev' }, '›'));
+}
+
+function stashCard(st) {
+  const text = h('span', null, 'Hai delle modifiche in corso che non hai ancora committato.');
+  stashDetails(st).then((d) => { text.textContent = `Hai ${d.files.length === 1 ? 'una modifica' : `${d.files.length} modifiche`} in corso che non hai ancora committato.`; }).catch(() => {});
+  return h('div', { class: 'banner accent', style: 'margin:16px' },
+    h('div', { class: 'text' }, h('strong', null, 'Visualizza le modifiche accantonate'), text,
+      h('span', { class: 'sub', style: 'display:block;margin-top:4px' }, 'Le trovi anche in fondo al pannello Modifiche, a sinistra.')),
+    h('button', { class: 'btn primary', onclick: openStashView }, 'Visualizza'));
+}
+
+async function renderStashView(st) {
+  const main = $('main');
+  const list = stashesForBranch();
+  const slot = h('div', { class: 'commit-split' }, h('div', { class: 'diff-message', style: 'flex:1' }, 'Caricamento…'));
+  const dirty = S.status.files.length;
+  const restore = h('button', {
+    class: 'btn primary',
+    title: dirty ? 'Hai altre modifiche in corso: fai commit o accantonale prima di ripristinare' : '',
+    onclick: (e) => busy(e.currentTarget, async () => {
+      if (S.status.files.length) {
+        const ok = await confirmDialog({ title: 'Ripristinare le modifiche?', message: 'Hai già altre modifiche in corso: Git proverà a unirle a quelle accantonate. Se toccano gli stessi file potresti dover risolvere dei conflitti.', confirm: 'Ripristina' });
+        if (!ok) return;
+      }
+      const r = await api('git:stashPop', st.ref);
+      S.showStash = false;
+      stashDetailsCache.delete(st.sha);
+      toast(r.conflicts ? 'Modifiche ripristinate con conflitti: risolvili nei file segnati con "!".' : 'Modifiche ripristinate.', { type: r.conflicts ? 'error' : 'success', timeout: r.conflicts ? 0 : 4500 });
+      await refreshStatus();
+    }),
+  }, 'Ripristina');
+  const discard = h('button', {
+    class: 'btn danger',
+    onclick: async () => {
+      const ok = await confirmDialog({ title: 'Eliminare le modifiche accantonate?', message: 'Le modifiche accantonate verranno cancellate definitivamente.', confirm: 'Elimina', danger: true });
+      if (!ok) return;
+      if (await busy(discard, async () => { await api('git:stashDrop', st.ref); return true; })) {
+        stashDetailsCache.delete(st.sha);
+        toast('Modifiche accantonate eliminate.');
+        if (!stashesForBranch().filter((x) => x.sha !== st.sha).length) S.showStash = false;
+        await refreshStatus();
+      }
+    },
+  }, 'Elimina');
+  const picker = list.length > 1 && h('select', {
+    'aria-label': 'Scegli quale accantonamento vedere',
+    onchange: (e) => { const chosen = list.find((x) => x.sha === e.target.value); if (chosen) renderStashView(chosen); },
+  }, list.map((x, i) => h('option', { value: x.sha, selected: x.sha === st.sha }, `${i === 0 ? 'Più recente' : `#${i + 1}`} — ${fullDate(x.date)}`)));
+
+  mount(main, h('div', { class: 'commit-view' },
+    h('div', { class: 'commit-head' },
+      h('h2', null, 'Modifiche accantonate'),
+      h('div', { class: 'meta' },
+        h('span', null, `Su ${st.branch}`), h('span', { class: 'sep' }, '·'),
+        h('span', { title: fullDate(st.date) }, `${fullDate(st.date)} (${ago(st.date)})`),
+        picker && [h('span', { class: 'sep' }, '·'), picker],
+        h('span', { class: 'inline', style: 'margin-left:auto' }, restore, discard)),
+      dirty > 0 && h('div', { class: 'hint warn', style: 'margin-top:6px' }, `Hai anche ${dirty} file con modifiche in corso: se ripristini, verranno unite a quelle accantonate.`)),
+    slot));
+
+  let d;
+  try { d = await stashDetails(st); } catch (e) { mount(slot, h('div', { class: 'diff-message', style: 'flex:1' }, e.message)); return; }
+  if (!S.showStash) return;
+  const n = d.files.length;
+  const split = filesDiffSplit({
+    files: d.files,
+    headText: `${n} file accantonat${n === 1 ? 'o' : 'i'}`,
+    selected: S.stashFile,
+    onSelect: (p) => { S.stashFile = p; },
+    getDiff: (f) => api('git:stashFileDiff', { sha: st.sha, file: f }),
+  });
+  slot.replaceWith(split.el);
+  split.start(main);
 }
 
 init().catch((e) => toast(`Avvio non riuscito: ${e.message}`, { type: 'error', timeout: 0 }));

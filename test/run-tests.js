@@ -175,6 +175,22 @@ async function t(name, fn) {
     assert.strictEqual((await git.status(repo)).files.length, 1);
     await git.discard(repo, (await git.status(repo)).files);
   });
+  await t('contenuto dello stash: file modificati e nuovi', async () => {
+    w('a.txt', 'uno modificato\n');
+    w('nuovo.txt', 'file nuovo\n');
+    await git.stashAll(repo);
+    const [st] = await git.stashList(repo);
+    assert.ok(/^[0-9a-f]{40}$/.test(st.sha));
+    const d = await git.stashDetails(repo, st.sha);
+    const byPath = Object.fromEntries(d.files.map((f) => [f.path, f]));
+    assert.strictEqual(byPath['a.txt'].kind, 'modified');
+    assert.ok(byPath['nuovo.txt'].untracked);
+    assert.ok((await git.stashFileDiff(repo, st.sha, byPath['a.txt'])).patch.includes('+uno modificato'));
+    assert.ok((await git.stashFileDiff(repo, st.sha, byPath['nuovo.txt'])).patch.includes('+file nuovo'));
+    await git.stashPop(repo, st.ref);
+    assert.strictEqual((await git.status(repo)).files.length, 2);
+    await git.discard(repo, (await git.status(repo)).files);
+  });
   await t('conflitto previsto, merge, blocco dei segni e completamento', async () => {
     await git.createBranch(repo, 'feat/b');
     w('a.txt', 'versione B\n'); await commitAll('B');

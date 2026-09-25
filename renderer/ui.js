@@ -3,12 +3,13 @@
 /* global window, document */
 // Piccole utilità per costruire l'interfaccia senza innerHTML (niente rischio di iniezione).
 
+const SVG_TAGS = new Set(['svg', 'path', 'g', 'circle', 'rect', 'line', 'polyline', 'polygon']);
 function h(tag, attrs, ...children) {
-  const el = document.createElement(tag);
+  const el = SVG_TAGS.has(tag) ? document.createElementNS('http://www.w3.org/2000/svg', tag) : document.createElement(tag);
   if (attrs) {
     for (const [k, v] of Object.entries(attrs)) {
       if (v === undefined || v === null || v === false) continue;
-      if (k === 'class') el.className = v;
+      if (k === 'class') { if (el instanceof SVGElement) el.setAttribute('class', v); else el.className = v; }
       else if (k === 'dataset') Object.assign(el.dataset, v);
       else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v);
       else if (k === 'style') el.style.cssText = v; // compatibile con la CSP (niente attributi style)

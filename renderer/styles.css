@@ -581,3 +581,23 @@ table.diff tr.note td { color: var(--faint); font-style: italic; }
 .img-frame.empty { width: 160px; height: 120px; display: grid; place-items: center; color: var(--faint); background: var(--bg); }
 .img-pane.before .img-frame { border-color: color-mix(in srgb, var(--del) 45%, var(--line)); }
 .img-pane.after .img-frame { border-color: color-mix(in srgb, var(--add) 45%, var(--line)); }
+
+/* ------------------------------------------------------------------ cambio branch e stash */
+.choices { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.choice { display: flex; gap: 10px; align-items: flex-start; padding: 11px 14px; cursor: pointer; }
+.choice + .choice { border-top: 1px solid var(--line); }
+.choice.checked { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+.choice input { margin: 3px 0 0; accent-color: var(--accent); }
+.choice strong { display: block; }
+.choice .sub { display: block; font-size: 12.5px; }
+.stash-bar {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 9px 12px; border: 0; border-bottom: 1px solid var(--line);
+  background: var(--side); color: var(--ink); font-weight: 600; text-align: left;
+}
+.stash-bar svg { color: var(--warn); flex-shrink: 0; }
+.stash-bar:hover { background: var(--hover); }
+.stash-bar.active { background: var(--select); }
+.stash-bar .chev { color: var(--muted); font-size: 16px; line-height: 1; }
+.stash-bar .grow { flex: 1; }
+.commit-head .meta select { padding: 2px 6px; font-size: 12px; }

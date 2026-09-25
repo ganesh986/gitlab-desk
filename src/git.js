@@ -443,6 +443,11 @@ function runBuffer(cwd, args) {
 async function commitFileDiff(cwd, sha, file) {
   checkSha(sha);
   const { parent } = await parentOf(cwd, sha);
+  return treeDiff(cwd, parent, sha, file);
+}
+
+// Diff di un file tra due commit (base null = albero vuoto), con anteprima per le immagini
+async function treeDiff(cwd, parent, sha, file) {
   const ext = (file.path.split('.').pop() || '').toLowerCase();
   if (IMAGE_TYPES[ext]) {
     const mime = IMAGE_TYPES[ext];
@@ -534,11 +539,11 @@ async function stashAll(cwd, branch) {
 }
 
 async function stashList(cwd) {
-  const out = await run(cwd, ['stash', 'list', `--format=%gd${US}%gs${US}%cI`]).catch(() => '');
+  const out = await run(cwd, ['stash', 'list', `--format=%gd${US}%H${US}%gs${US}%cI`]).catch(() => '');
   return out.split('\n').filter(Boolean).map((line) => {
-    const [ref, subject, date] = line.split(US);
+    const [ref, sha, subject, date] = line.split(US);
     const m = subject.match(/^(?:WIP on|On) ([^:]+): (.*)$/);
-    return { ref, branch: m ? m[1] : null, message: m ? m[2] : subject, date };
+    return { ref, sha, branch: m ? m[1] : null, message: m ? m[2] : subject, date };
   });
 }
 
@@ -546,11 +551,31 @@ function checkStashRef(ref) {
   if (!/^stash@\{\d+\}$/.test(ref)) throw new GitError('Riferimento allo stash non valido.');
 }
 
-async function stashFiles(cwd, ref) {
-  checkStashRef(ref);
-  const out = await run(cwd, ['stash', 'show', '--name-only', '--include-untracked', ref])
-    .catch(() => run(cwd, ['stash', 'show', '--name-only', ref]).catch(() => ''));
-  return out.split('\n').filter(Boolean);
+// Uno stash è un commit speciale: 1° genitore = HEAD di allora, 3° genitore (se c'è) = file nuovi non tracciati
+async function stashParents(cwd, sha) {
+  checkSha(sha);
+  const p = (await run(cwd, ['rev-list', '--parents', '-n', '1', sha])).trim().split(' ');
+  return { base: p[1], untracked: p[3] || null };
+}
+
+async function stashDetails(cwd, sha) {
+  const { base, untracked } = await stashParents(cwd, sha);
+  const tracked = parseNameStatus(await run(cwd, ['diff-tree', '-r', '-M', '-z', '--name-status', '--no-commit-id', base, sha]));
+  const extra = untracked
+    ? parseNameStatus(await run(cwd, ['diff-tree', '-r', '-z', '--name-status', '--no-commit-id', EMPTY_TREE, untracked])).map((f) => ({ ...f, kind: 'added', untracked: true }))
+    : [];
+  const files = [...tracked, ...extra].sort((a, b) => a.path.localeCompare(b.path));
+  return { sha, files };
+}
+
+async function stashFiles(cwd, refOrSha) {
+  const sha = /^stash@/.test(refOrSha) ? (await run(cwd, ['rev-parse', refOrSha])).trim() : refOrSha;
+  return (await stashDetails(cwd, sha)).files.map((f) => f.path);
+}
+
+async function stashFileDiff(cwd, sha, file) {
+  const { base, untracked } = await stashParents(cwd, sha);
+  return file.untracked ? treeDiff(cwd, null, untracked, file) : treeDiff(cwd, base, sha, file);
 }
 
 async function stashPop(cwd, ref) {
@@ -702,6 +727,6 @@ module.exports = {
   log, unpushedShas, showCommit, commitFiles, commitFileDiff, branches, createBranch, checkout, deleteBranch, validateBranchName,
   fetch, pull, push, forcePush, clone,
   pendingMessage, filesWithMarkers, renameBranch, deleteRemoteBranch,
-  stashAll, stashList, stashFiles, stashPop, stashDrop,
+  stashAll, stashList, stashFiles, stashDetails, stashFileDiff, stashPop, stashDrop,
   compare, mergePreview, merge, abortMerge, rebase, rebaseContinue, rebaseAbort,
 };
