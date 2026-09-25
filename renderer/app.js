@@ -59,6 +59,7 @@ function bindChrome() {
     else openNewMr();
   });
   document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+  setupSplitter();
 
   window.desk.on('app:focus', debounce(() => { if (S.repo) refreshStatus(); }, 300));
   window.desk.on('menu', (cmd) => {
@@ -77,6 +78,62 @@ function bindChrome() {
       'open-gitlab': () => (S.project ? api('shell:open', S.project.webUrl) : toast(S.projectError || 'Progetto GitLab non disponibile.')),
     })[cmd]?.();
   });
+}
+
+// Pannello laterale ridimensionabile: trascina il divisore, frecce da tastiera, doppio clic per ripristinare.
+function setupSplitter() {
+  const splitter = $('splitter');
+  const DEFAULT = 320;
+  const MIN = 220;
+  const maxWidth = () => Math.max(MIN, Math.min(900, window.innerWidth - 420));
+  const clamp = (w) => Math.round(Math.min(maxWidth(), Math.max(MIN, w)));
+  let width = DEFAULT;
+  let preferred = DEFAULT; // larghezza scelta dall'utente, anche se la finestra ora è più stretta
+  const apply = (w, save = true) => {
+    if (save || document.body.classList.contains('resizing')) preferred = w;
+    width = clamp(w);
+    document.documentElement.style.setProperty('--side-width', `${width}px`);
+    splitter.setAttribute('aria-valuenow', String(width));
+    if (save) { try { localStorage.setItem('sideWidth', String(width)); } catch { /* ignora */ } }
+  };
+  let saved = NaN;
+  try { saved = parseInt(localStorage.getItem('sideWidth'), 10); } catch { /* ignora */ }
+  preferred = Number.isFinite(saved) ? saved : DEFAULT;
+  apply(preferred, false);
+  splitter.setAttribute('aria-valuemin', String(MIN));
+
+  splitter.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = width;
+    splitter.setPointerCapture(e.pointerId);
+    splitter.classList.add('dragging');
+    document.body.classList.add('resizing');
+    const move = (ev) => apply(startW + ev.clientX - startX, false);
+    const up = () => {
+      splitter.removeEventListener('pointermove', move);
+      splitter.removeEventListener('pointerup', up);
+      splitter.removeEventListener('pointercancel', up);
+      splitter.classList.remove('dragging');
+      document.body.classList.remove('resizing');
+      apply(width);
+      preferred = width;
+    };
+    splitter.addEventListener('pointermove', move);
+    splitter.addEventListener('pointerup', up);
+    splitter.addEventListener('pointercancel', up);
+  });
+  splitter.addEventListener('dblclick', () => apply(DEFAULT));
+  splitter.addEventListener('keydown', (e) => {
+    const step = e.shiftKey ? 50 : 10;
+    if (e.key === 'ArrowLeft') { apply(width - step); e.preventDefault(); }
+    else if (e.key === 'ArrowRight') { apply(width + step); e.preventDefault(); }
+    else if (e.key === 'Home') { apply(MIN); e.preventDefault(); }
+    else if (e.key === 'End') { apply(maxWidth()); e.preventDefault(); }
+  });
+  // Se la finestra si restringe, il pannello non deve schiacciare l'area principale
+  window.addEventListener('resize', debounce(() => { width = clamp(preferred); document.documentElement.style.setProperty('--side-width', `${width}px`); }, 100));
 }
 
 async function setRepo(info) {
