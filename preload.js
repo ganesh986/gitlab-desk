@@ -11,7 +11,7 @@ const channels = [
   'git:branches', 'git:createBranch', 'git:checkout', 'git:deleteBranch',
   'git:fetch', 'git:pull', 'git:push', 'git:commitsBetween',
   'gl:project', 'gl:me', 'gl:searchProjects', 'gl:mrs', 'gl:mrForBranch', 'gl:mr', 'gl:branches', 'gl:members', 'gl:createMR',
-  'shell:open',
+  'shell:open', 'dialog:pickFile', 'files:contextMenu', 'files:openInEditor',
 ];
 
 const api = {};

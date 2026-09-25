@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const git = require('../src/git');
 const { parseRemote, matchesInstance, GitLab } = require('../src/gitlab');
+const gi = require('../src/gitignore');
 
 let passed = 0;
 async function t(name, fn) {
@@ -120,6 +121,26 @@ async function t(name, fn) {
     const env = git.authEnv('https://gitlab.azienda.it/a/b.git', { baseUrl: 'https://gitlab.azienda.it', token: 'abc' });
     assert.strictEqual(env.GIT_CONFIG_KEY_0, 'http.https://gitlab.azienda.it/.extraHeader');
     assert.deepStrictEqual(git.authEnv('https://github.com/a/b.git', { baseUrl: 'https://gitlab.azienda.it', token: 'abc' }), {});
+  });
+
+  console.log('.gitignore');
+  await t('regole per file ed estensioni', () => {
+    assert.strictEqual(gi.patternForPath('docs/bozza [1].pdf'), '/docs/bozza \\[1\\].pdf');
+    assert.strictEqual(gi.patternForExtension('.pdf'), '*.pdf');
+    assert.strictEqual(gi.extensionOf('a/b/report.final.PDF'), 'PDF');
+    assert.strictEqual(gi.extensionOf('.env'), null);
+    assert.strictEqual(gi.extensionOf('Makefile'), null);
+  });
+  await t('aggiunta senza duplicati e file ignorati da git', async () => {
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/'); // senza a capo finale
+    fs.writeFileSync(path.join(repo, 'bozza.pdf'), 'x');
+    fs.mkdirSync(path.join(repo, 'out'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'out', 'a b.log'), 'x');
+    assert.deepStrictEqual(gi.addPatterns(repo, ['*.pdf', '/out/a b.log']), ['*.pdf', '/out/a b.log']);
+    assert.deepStrictEqual(gi.addPatterns(repo, ['*.pdf']), []);
+    assert.strictEqual(fs.readFileSync(path.join(repo, '.gitignore'), 'utf8'), 'node_modules/\n*.pdf\n/out/a b.log\n');
+    const s = await git.status(repo);
+    assert.deepStrictEqual(s.files.map((f) => f.path), ['.gitignore']);
   });
 
   fs.rmSync(tmp, { recursive: true, force: true });

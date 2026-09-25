@@ -4,7 +4,7 @@
 
 Client desktop in stile GitHub Desktop per lavorare con un server GitLab aziendale (self-managed) o con gitlab.com.
 
-Funzioni della prima versione: elenco delle modifiche con diff e spunta dei file da includere, commit con titolo e descrizione, annulla ultimo commit, scarta modifiche, cronologia con dettaglio dei commit, branch (crea, cambia, elimina, checkout di branch remoti), fetch/pull/push con conteggio dei commit da pubblicare e da scaricare, clonazione dai tuoi progetti GitLab o da URL, e merge request: elenco, dettaglio con stato di pipeline e approvazioni, creazione con revisori, bozza, squash ed eliminazione del branch dopo il merge. Se il branch non è ancora pubblicato, l'app fa il push da sola prima di creare la merge request.
+Funzioni principali: elenco delle modifiche con diff e spunta dei file da includere, selezione multipla (Ctrl+clic, Maiusc+clic, frecce) con menu contestuale per scartare, ignorare con .gitignore (singoli file o per estensione), includere o escludere, copiare i percorsi e aprire i file nell'editor preferito o in Esplora risorse, commit con titolo e descrizione, annulla ultimo commit, scarta modifiche, cronologia con dettaglio dei commit, branch (crea, cambia, elimina, checkout di branch remoti), fetch/pull/push con conteggio dei commit da pubblicare e da scaricare, clonazione dai tuoi progetti GitLab o da URL, e merge request: elenco, dettaglio con stato di pipeline e approvazioni, creazione con revisori, bozza, squash ed eliminazione del branch dopo il merge. Se il branch non è ancora pubblicato, l'app fa il push da sola prima di creare la merge request.
 
 ## Requisiti
 

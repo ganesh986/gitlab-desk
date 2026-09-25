@@ -10,7 +10,9 @@ const S = {
   repo: null,          // { path, name, remoteUrl, projectPath, onGitlab }
   status: null,
   tab: 'changes',
-  selectedFile: null,
+  selectedFile: null,  // file con il focus (quello di cui si vede il diff)
+  selection: new Set(), // file selezionati nell'elenco (clic, Ctrl+clic, Maiusc+clic)
+  pivot: null,         // punto di partenza per le selezioni con Maiusc
   excluded: new Set(), // file esclusi dal prossimo commit
   draft: { summary: '', description: '' },
   history: [],
@@ -60,6 +62,7 @@ function bindChrome() {
   });
   document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => switchTab(t.dataset.tab)));
   setupSplitter();
+  $('side-body').addEventListener('keydown', onFileListKey);
 
   window.desk.on('app:focus', debounce(() => { if (S.repo) refreshStatus(); }, 300));
   window.desk.on('menu', (cmd) => {
@@ -138,7 +141,7 @@ function setupSplitter() {
 
 async function setRepo(info) {
   Object.assign(S, {
-    repo: info, status: null, selectedFile: null, excluded: new Set(), draft: { summary: '', description: '' },
+    repo: info, status: null, selectedFile: null, selection: new Set(), pivot: null, excluded: new Set(), draft: { summary: '', description: '' },
     history: [], historyDone: false, selectedCommit: null, project: null, projectError: null,
     branchMr: null, mrs: [], mrView: null, mrsError: null,
   });
@@ -166,6 +169,8 @@ async function refreshStatus() {
     const paths = new Set(S.status.files.map((f) => f.path));
     for (const p of [...S.excluded]) if (!paths.has(p)) S.excluded.delete(p);
     if (S.selectedFile && !paths.has(S.selectedFile)) S.selectedFile = null;
+    for (const p of [...S.selection]) if (!paths.has(p)) S.selection.delete(p);
+    if (S.pivot && !paths.has(S.pivot)) S.pivot = null;
     if (prevBranch !== undefined && prevBranch !== S.status.branch) {
       S.branchMr = null;
       S.history = []; S.historyDone = false; S.selectedCommit = null;
@@ -292,7 +297,7 @@ function renderWelcome() {
 
 // ------------------------------------------------------------------ Modifiche
 
-function renderChanges() {
+function renderChanges({ keepMain = false } = {}) {
   const side = $('side-body');
   const foot = $('side-foot');
   const s = S.status;
@@ -303,7 +308,7 @@ function renderChanges() {
   const allBox = h('input', {
     type: 'checkbox', 'aria-label': 'Includi tutti i file',
     checked: files.length > 0 && included.length === files.length,
-    onchange: (e) => { S.excluded = e.target.checked ? new Set() : new Set(files.map((f) => f.path)); renderChanges(); },
+    onchange: (e) => { S.excluded = e.target.checked ? new Set() : new Set(files.map((f) => f.path)); renderChanges({ keepMain: S.selection.size === 1 }); },
   });
   allBox.indeterminate = included.length > 0 && included.length < files.length;
 
@@ -316,7 +321,8 @@ function renderChanges() {
       files.length > 0 && allBox,
       h('span', { class: 'grow' }, files.length ? `${files.length} file modificat${files.length === 1 ? 'o' : 'i'}` : 'Nessuna modifica'),
       files.length > 0 && h('button', { class: 'link', onclick: () => discardFiles(files) }, 'Scarta tutto')),
-    files.map((f) => fileRow(f)));
+    h('div', { class: 'file-list', role: 'listbox', 'aria-multiselectable': 'true', 'aria-label': 'File modificati' },
+      files.map((f) => fileRow(f))));
 
   // Box di commit
   const onDefault = S.project && s.branch === S.project.defaultBranch;
@@ -344,9 +350,138 @@ function renderChanges() {
       ' (non ancora pubblicato)')));
 
   // Pannello principale
-  const file = files.find((f) => f.path === S.selectedFile);
-  if (file) renderFileDiff(file);
+  if (keepMain) return;
+  const selected = files.filter((f) => S.selection.has(f.path));
+  if (selected.length === 1) renderFileDiff(selected[0]);
+  else if (selected.length > 1) renderMultiSelection(selected);
   else renderChangesOverview();
+}
+
+// ----- selezione multipla
+
+function selectFile(p, { shift = false, toggle = false } = {}) {
+  const order = S.status.files.map((f) => f.path);
+  if (shift && S.pivot && order.includes(S.pivot)) {
+    const a = order.indexOf(S.pivot);
+    const b = order.indexOf(p);
+    const range = order.slice(Math.min(a, b), Math.max(a, b) + 1);
+    S.selection = toggle ? new Set([...S.selection, ...range]) : new Set(range);
+  } else if (toggle) {
+    if (S.selection.has(p)) S.selection.delete(p); else S.selection.add(p);
+    S.pivot = p;
+  } else {
+    S.selection = new Set([p]);
+    S.pivot = p;
+  }
+  S.selectedFile = p;
+  renderChanges();
+}
+
+function selectedFiles() {
+  return S.status ? S.status.files.filter((f) => S.selection.has(f.path)) : [];
+}
+
+function setIncluded(files, include) {
+  for (const f of files) { if (include) S.excluded.delete(f.path); else S.excluded.add(f.path); }
+  renderChanges({ keepMain: S.selection.size === 1 });
+}
+
+// Tastiera sull'elenco: frecce (con Maiusc per estendere), Ctrl+A, Spazio per includere/escludere,
+// tasto Menu o Maiusc+F10 per il menu contestuale
+function onFileListKey(e) {
+  if (S.tab !== 'changes' || !S.status || !S.status.files.length) return;
+  if (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(e.target.tagName)) return;
+  const order = S.status.files.map((f) => f.path);
+  const cur = order.indexOf(S.selectedFile);
+  const mod = e.ctrlKey || e.metaKey;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    const next = order[Math.max(0, Math.min(order.length - 1, cur < 0 ? 0 : cur + (e.key === 'ArrowDown' ? 1 : -1)))];
+    if (e.shiftKey) { if (!S.pivot) S.pivot = S.selectedFile || next; selectFile(next, { shift: true }); }
+    else selectFile(next);
+    scrollFocusedRow();
+  } else if (mod && e.key.toLowerCase() === 'a') {
+    e.preventDefault();
+    S.selection = new Set(order);
+    renderChanges();
+  } else if (e.key === ' ' && S.selection.size) {
+    e.preventDefault();
+    const sel = selectedFiles();
+    setIncluded(sel, sel.some((f) => S.excluded.has(f.path)));
+  } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+    e.preventDefault();
+    if (S.selection.size) openFileMenu();
+  } else if (e.key === 'Escape' && S.selection.size) {
+    S.selection = new Set();
+    S.selectedFile = null;
+    renderChanges();
+  }
+}
+
+function scrollFocusedRow() {
+  const row = document.querySelector('.file-list .row.focused');
+  if (row) row.scrollIntoView({ block: 'nearest' });
+}
+
+async function openFileMenu() {
+  const files = selectedFiles();
+  if (!files.length) return;
+  let r;
+  try {
+    r = await api('files:contextMenu', {
+      files,
+      canInclude: files.some((f) => S.excluded.has(f.path)),
+      canExclude: files.some((f) => !S.excluded.has(f.path)),
+    });
+  } catch (e) { toast(e.message, { type: 'error' }); return; }
+  if (!r) return;
+  switch (r.action) {
+    case 'discard': discardFiles(files); break;
+    case 'include': setIncluded(files, true); break;
+    case 'exclude': setIncluded(files, false); break;
+    case 'copied': toast('Copiato negli appunti.'); break;
+    case 'settings': openSettings(); break;
+    case 'error': toast(r.error, { type: 'error', timeout: 0 }); break;
+    case 'ignored': {
+      let msg = r.added.length
+        ? `Aggiunt${r.added.length === 1 ? 'a' : 'e'} a .gitignore: ${r.added.slice(0, 5).join(', ')}${r.added.length > 5 ? '…' : ''}`
+        : 'Le regole erano già presenti in .gitignore.';
+      if (r.tracked) msg += `\n\n${r.tracked === 1 ? 'Un file è' : `${r.tracked} file sono`} già nel repository: Git continuerà a seguirl${r.tracked === 1 ? 'o' : 'i'} finché non ${r.tracked === 1 ? 'viene rimosso' : 'vengono rimossi'} con un commit.`;
+      toast(msg, { type: 'success', timeout: r.tracked ? 9000 : 4500 });
+      S.selection = new Set();
+      S.selectedFile = null;
+      await refreshStatus();
+      break;
+    }
+    default: break;
+  }
+}
+
+function editorButton(paths, small = true) {
+  const name = S.settings.editorName;
+  return h('button', {
+    class: 'btn' + (small ? ' small' : ''),
+    title: name ? `Apri in ${name}` : 'Scegli un editor nelle impostazioni',
+    onclick: () => (name ? api('files:openInEditor', paths).catch((e) => toast(e.message, { type: 'error' })) : openSettings()),
+  }, name ? `Apri in ${name}` : 'Apri nell\'editor');
+}
+
+function renderMultiSelection(files) {
+  const nIncluded = files.filter((f) => !S.excluded.has(f.path)).length;
+  const kinds = {};
+  for (const f of files) kinds[f.kind] = (kinds[f.kind] || 0) + 1;
+  const kindLabel = { added: 'nuovi', modified: 'modificati', deleted: 'eliminati', renamed: 'rinominati', conflict: 'in conflitto' };
+  const summary = Object.entries(kinds).map(([k, n]) => `${n} ${kindLabel[k] || k}`).join(', ');
+  mount($('main'), h('div', { class: 'main-scroll' }, h('div', { class: 'empty' },
+    h('h1', null, `${files.length} file selezionati`),
+    h('p', null, `${summary}. ${nIncluded === files.length ? 'Sono tutti inclusi nel prossimo commit.' : nIncluded === 0 ? 'Nessuno è incluso nel prossimo commit.' : `${nIncluded} sono inclusi nel prossimo commit.`}`),
+    h('div', { class: 'actions' },
+      nIncluded < files.length && h('button', { class: 'btn primary', onclick: () => setIncluded(files, true) }, 'Includi tutti'),
+      nIncluded > 0 && h('button', { class: 'btn', onclick: () => setIncluded(files, false) }, 'Escludi tutti'),
+      editorButton(files.filter((f) => f.kind !== 'deleted').map((f) => f.path), false),
+      h('button', { class: 'btn', onclick: openFileMenu }, 'Altre azioni…'),
+      h('button', { class: 'btn danger', onclick: () => discardFiles(files) }, 'Scarta modifiche')),
+    h('p', { class: 'hint', style: 'margin-top:18px' }, 'Suggerimento: Ctrl+clic aggiunge o toglie un file dalla selezione, Maiusc+clic seleziona un intervallo. Tasto destro per tutte le azioni.'))));
 }
 
 function fileRow(f) {
@@ -356,14 +491,29 @@ function fileRow(f) {
   const dir = slash >= 0 ? f.path.slice(0, slash + 1) : '';
   const base = f.path.slice(slash + 1);
   return h('div', {
-    class: 'row' + (S.selectedFile === f.path ? ' selected' : ''),
+    class: 'row' + (S.selection.has(f.path) ? ' selected' : '') + (S.selectedFile === f.path ? ' focused' : ''),
+    role: 'option',
+    'aria-selected': String(S.selection.has(f.path)),
     title: f.origPath ? `${f.origPath} → ${f.path}` : f.path,
-    onclick: (e) => { if (e.target.tagName === 'INPUT') return; S.selectedFile = f.path; renderChanges(); },
-    oncontextmenu: (e) => { e.preventDefault(); discardFiles([f]); },
+    onmousedown: (e) => { if (e.shiftKey) e.preventDefault(); }, // evita la selezione del testo con Maiusc+clic
+    onclick: (e) => {
+      if (e.target.tagName === 'INPUT') return;
+      selectFile(f.path, { shift: e.shiftKey, toggle: e.ctrlKey || e.metaKey });
+      $('side-body').focus({ preventScroll: true });
+    },
+    oncontextmenu: (e) => {
+      e.preventDefault();
+      if (!S.selection.has(f.path)) { S.selection = new Set([f.path]); S.pivot = f.path; S.selectedFile = f.path; renderChanges(); }
+      openFileMenu();
+    },
   },
   h('input', {
     type: 'checkbox', 'aria-label': `Includi ${f.path}`, checked: !S.excluded.has(f.path),
-    onchange: (e) => { if (e.target.checked) S.excluded.delete(f.path); else S.excluded.add(f.path); renderChanges(); },
+    onchange: (e) => {
+      // Se il file fa parte di una selezione multipla, la spunta vale per tutti i selezionati
+      const targets = S.selection.has(f.path) && S.selection.size > 1 ? selectedFiles() : [f];
+      setIncluded(targets, e.target.checked);
+    },
   }),
   h('span', { class: 'file-name' }, h('bdi', null, h('span', { class: 'file-dir' }, dir), base)),
   h('span', { class: `kind ${f.kind}`, title }, letter));
@@ -375,11 +525,12 @@ async function renderFileDiff(file) {
   mount(main,
     h('div', { class: 'main-head' },
       h('span', { class: 'title path' }, file.origPath ? `${file.origPath} → ${file.path}` : file.path),
+      file.kind !== 'deleted' && editorButton([file.path]),
       h('button', { class: 'btn small danger', onclick: () => discardFiles([file]) }, 'Scarta modifiche')),
     body);
   try {
     const d = await api('git:diff', file);
-    if (S.selectedFile !== file.path) return;
+    if (!S.selection.has(file.path) || S.selection.size !== 1) return;
     mount(body, renderDiff(d, { showFileHeaders: false }));
   } catch (e) { mount(body, h('div', { class: 'diff-message' }, e.message)); }
 }
@@ -434,6 +585,7 @@ async function doCommit(btn) {
     S.draft = { summary: '', description: '' };
     S.excluded = new Set();
     S.selectedFile = null;
+    S.selection = new Set();
     S.history = [];
     await refreshStatus();
   }
@@ -927,6 +1079,21 @@ function openSettings({ firstRun } = {}) {
   const tokenIn = h('input', { type: 'password', placeholder: st.hasToken ? 'Token salvato (lascia vuoto per non cambiarlo)' : 'glpat-…', autocomplete: 'off' });
   const useForGit = h('input', { type: 'checkbox', checked: st.useTokenForGit });
   const gitPath = h('input', { type: 'text', value: st.gitPath, placeholder: 'git (dal PATH di sistema)' });
+
+  // Editor esterno: automatico, uno di quelli rilevati, oppure un programma a scelta
+  const detected = st.detectedEditors || [];
+  const isDetected = detected.some((e) => e.path === st.editorPath);
+  const editorSel = h('select', null,
+    h('option', { value: '' }, detected.length ? `Automatico (${detected[0].name})` : 'Automatico (nessun editor rilevato)'),
+    detected.map((e) => h('option', { value: e.path, selected: st.editorPath === e.path }, e.name)),
+    h('option', { value: '__custom', selected: !!st.editorPath && !isDetected }, 'Altro programma…'));
+  const editorPath = h('input', { type: 'text', readonly: true, style: 'flex:1', value: st.editorPath && !isDetected ? st.editorPath : '', placeholder: 'Percorso del programma' });
+  const editorPick = h('button', { class: 'btn', onclick: async () => { const f = await api('dialog:pickFile', 'Scegli il programma per aprire i file'); if (f) editorPath.value = f; } }, 'Scegli…');
+  const customRow = h('div', { class: 'inline' }, editorPath, editorPick);
+  const syncEditor = () => { customRow.hidden = editorSel.value !== '__custom'; };
+  editorSel.addEventListener('change', syncEditor);
+  syncEditor();
+  const chosenEditor = () => (editorSel.value === '__custom' ? editorPath.value : editorSel.value);
   const result = h('div');
 
   const tokenLink = h('button', {
@@ -954,7 +1121,7 @@ function openSettings({ firstRun } = {}) {
     class: 'btn primary',
     onclick: async () => {
       const saved = await busy(save, () => api('settings:save', {
-        gitlabUrl: urlIn.value, token: tokenIn.value || undefined, useTokenForGit: useForGit.checked, gitPath: gitPath.value,
+        gitlabUrl: urlIn.value, token: tokenIn.value || undefined, useTokenForGit: useForGit.checked, gitPath: gitPath.value, editorPath: chosenEditor(),
       }));
       if (!saved) return;
       const changed = saved.gitlabUrl !== S.settings.gitlabUrl || tokenIn.value;
@@ -978,6 +1145,8 @@ function openSettings({ firstRun } = {}) {
         st.hasToken && h('button', { class: 'link', style: 'align-self:flex-start', onclick: async () => { S.settings = await api('settings:save', { clearToken: true }); tokenIn.placeholder = 'glpat-…'; toast('Token rimosso.'); } }, 'Rimuovi il token salvato')),
       !st.encryptionAvailable && h('div', { class: 'status-line err' }, 'Il portachiavi di sistema non è disponibile: il token verrebbe salvato senza cifratura nella cartella dati dell\'app.'),
       h('div', { class: 'checks' }, h('label', null, useForGit, 'Usa il token anche per clone, pull e push via HTTPS')),
+      h('div', { class: 'field' }, h('label', null, 'Editor per aprire i file'), editorSel, customRow,
+        h('span', { class: 'help' }, 'Usato da "Apri in…" nel menu con il tasto destro sui file modificati.')),
       h('details', null, h('summary', { style: 'cursor:pointer;color:var(--muted)' }, 'Avanzate'),
         h('div', { class: 'field', style: 'margin-top:10px' }, h('label', null, 'Percorso di Git'), gitPath,
           h('span', { class: 'help' }, 'Lascia vuoto per usare quello installato nel sistema. Su Windows di solito è C:\\Program Files\\Git\\cmd\\git.exe'))),

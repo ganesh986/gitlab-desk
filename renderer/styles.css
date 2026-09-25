@@ -240,6 +240,9 @@ body.resizing iframe, body.resizing .main { pointer-events: none; }
 }
 .row:hover { background: var(--hover); }
 .row.selected { background: var(--select); }
+.side-body { outline: none; }
+.side-body:focus .file-list .row.focused { box-shadow: inset 2px 0 0 var(--accent); }
+.file-list .row { user-select: none; }
 .row input[type="checkbox"] { margin: 0; accent-color: var(--accent); }
 .file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 .file-name bdi { direction: ltr; }

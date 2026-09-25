@@ -1,10 +1,12 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, shell, net, safeStorage, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, net, safeStorage, Menu, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const git = require('./src/git');
 const { GitLab, parseRemote, matchesInstance, normalizeBaseUrl } = require('./src/gitlab');
 const { Settings } = require('./src/settings');
+const gitignore = require('./src/gitignore');
+const editors = require('./src/editors');
 
 let win;
 let settings;
@@ -101,16 +103,32 @@ function buildMenu() {
 // ---------------------------------------------------------------------------
 // Impostazioni
 
-handle('settings:get', () => settings.publicView());
+function publicSettings() {
+  const detected = editors.detectEditors();
+  const editor = currentEditor(detected);
+  return { ...settings.publicView(), detectedEditors: detected, editorName: editor ? editor.name : null };
+}
 
-handle('settings:save', ({ gitlabUrl, token, clearToken, useTokenForGit, gitPath }) => {
+function currentEditor(detected = editors.detectEditors()) {
+  const custom = settings.data.editorPath;
+  if (custom) {
+    const known = detected.find((e) => e.path === custom);
+    return known || { name: editors.nameFromPath(custom), path: custom };
+  }
+  return detected[0] || null;
+}
+
+handle('settings:get', () => publicSettings());
+
+handle('settings:save', ({ gitlabUrl, token, clearToken, useTokenForGit, gitPath, editorPath }) => {
   if (gitlabUrl !== undefined) settings.data.gitlabUrl = normalizeBaseUrl(gitlabUrl);
   if (clearToken) settings.setToken(null);
   else if (token) settings.setToken(token.trim());
   if (useTokenForGit !== undefined) settings.data.useTokenForGit = !!useTokenForGit;
   if (gitPath !== undefined) { settings.data.gitPath = gitPath.trim(); git.setGitBinary(settings.data.gitPath); }
+  if (editorPath !== undefined) settings.data.editorPath = editorPath.trim();
   settings.save();
-  return settings.publicView();
+  return publicSettings();
 });
 
 handle('settings:test', async ({ gitlabUrl, token } = {}) => {
@@ -167,6 +185,12 @@ handle('repo:pick', async () => {
 handle('repo:forget', (p) => { settings.removeRecent(p); if (currentRepo === p) currentRepo = null; return true; });
 
 handle('repo:reveal', () => shell.openPath(requireRepo()));
+
+handle('dialog:pickFile', async (title) => {
+  const filters = process.platform === 'win32' ? [{ name: 'Programmi', extensions: ['exe', 'cmd', 'bat'] }] : [];
+  const r = await dialog.showOpenDialog(win, { title: title || 'Scegli un file', properties: ['openFile'], filters });
+  return r.canceled ? null : r.filePaths[0];
+});
 
 handle('dialog:pickFolder', async (title) => {
   const r = await dialog.showOpenDialog(win, { title: title || 'Scegli una cartella', properties: ['openDirectory', 'createDirectory'] });
@@ -239,6 +263,86 @@ handle('git:commitsBetween', async (target) => {
   const ref = `origin/${target}`;
   try { return await git.log(repo, { limit: 50, range: `${ref}..HEAD` }); } catch { return []; }
 });
+
+// ---------------------------------------------------------------------------
+// Azioni sui file modificati
+
+// Percorso assoluto di un file del repository, rifiutando percorsi che escono dalla cartella
+function repoFile(rel) {
+  const root = path.resolve(requireRepo());
+  const abs = path.resolve(root, rel);
+  if (abs !== root && !abs.startsWith(root + path.sep)) throw new Error('Percorso non valido.');
+  return abs;
+}
+
+function ignoreFiles(patterns, files) {
+  const added = gitignore.addPatterns(requireRepo(), patterns);
+  const tracked = files.filter((f) => !f.untracked).length;
+  return { action: 'ignored', added, tracked };
+}
+
+function openFilesInEditor(rels) {
+  const existing = rels.map(repoFile).filter((p) => fs.existsSync(p)).slice(0, 20);
+  if (!existing.length) throw new Error('I file selezionati non esistono più sul disco.');
+  editors.openInEditor(currentEditor(), existing);
+}
+
+handle('files:openInEditor', (rels) => openFilesInEditor(rels));
+
+handle('files:contextMenu', ({ files, canInclude, canExclude }) => new Promise((resolve) => {
+  const n = files.length;
+  const rels = files.map((f) => f.path);
+  const one = n === 1;
+  const editor = currentEditor();
+  const existing = rels.filter((r) => { try { return fs.existsSync(repoFile(r)); } catch { return false; } });
+  let settled = false;
+  const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+  const run = (fn) => () => {
+    try { done(fn()); } catch (e) { done({ action: 'error', error: e.message }); }
+  };
+
+  const exts = [...new Set(rels.map(gitignore.extensionOf).filter(Boolean))].slice(0, 3);
+  const onlyGitignore = rels.every((r) => r === '.gitignore');
+  const revealLabel = process.platform === 'win32' ? 'Mostra in Esplora risorse' : process.platform === 'darwin' ? 'Mostra nel Finder' : 'Mostra nella cartella';
+
+  const template = [
+    { label: one ? 'Scarta le modifiche…' : `Scarta ${n} modifiche selezionate…`, click: () => done({ action: 'discard' }) },
+    { type: 'separator' },
+    {
+      label: one ? 'Ignora il file (aggiungi a .gitignore)' : `Ignora ${n} file selezionati (aggiungi a .gitignore)`,
+      enabled: !onlyGitignore,
+      click: run(() => ignoreFiles(rels.filter((r) => r !== '.gitignore').map(gitignore.patternForPath), files)),
+    },
+    ...exts.map((ext) => ({
+      label: `Ignora tutti i file .${ext} (aggiungi a .gitignore)`,
+      click: run(() => ignoreFiles([gitignore.patternForExtension(ext)], files.filter((f) => gitignore.extensionOf(f.path) === ext))),
+    })),
+    { type: 'separator' },
+    { label: one ? 'Includi nel commit' : 'Includi i file selezionati', enabled: canInclude, click: () => done({ action: 'include' }) },
+    { label: one ? 'Escludi dal commit' : 'Escludi i file selezionati', enabled: canExclude, click: () => done({ action: 'exclude' }) },
+    { type: 'separator' },
+    { label: one ? 'Copia percorso' : 'Copia percorsi', click: run(() => { clipboard.writeText(rels.map(repoFile).join('\n')); return { action: 'copied' }; }) },
+    { label: one ? 'Copia percorso relativo' : 'Copia percorsi relativi', click: run(() => { clipboard.writeText(rels.map((r) => r.split('/').join(path.sep)).join('\n')); return { action: 'copied' }; }) },
+    { type: 'separator' },
+    {
+      label: revealLabel,
+      click: run(() => {
+        const target = existing[0] ? repoFile(existing[0]) : path.dirname(repoFile(rels[0]));
+        if (existing[0]) shell.showItemInFolder(target); else shell.openPath(fs.existsSync(target) ? target : requireRepo());
+        return { action: 'none' };
+      }),
+    },
+    editor
+      ? { label: `Apri in ${editor.name}`, enabled: existing.length > 0, click: run(() => { openFilesInEditor(existing); return { action: 'none' }; }) }
+      : { label: 'Apri nell\'editor… (scegli nelle impostazioni)', click: () => done({ action: 'settings' }) },
+    {
+      label: 'Apri con il programma predefinito',
+      enabled: one && existing.length === 1,
+      click: run(() => { shell.openPath(repoFile(existing[0])); return { action: 'none' }; }),
+    },
+  ];
+  Menu.buildFromTemplate(template).popup({ window: win, callback: () => setTimeout(() => done(null), 50) });
+}));
 
 // ---------------------------------------------------------------------------
 // GitLab

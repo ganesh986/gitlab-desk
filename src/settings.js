@@ -12,6 +12,7 @@ const DEFAULTS = {
   tokenPlain: null,     // solo se la cifratura non è disponibile sul sistema
   useTokenForGit: true, // usa il token anche per push/pull via HTTPS
   gitPath: '',
+  editorPath: '',      // vuoto = primo editor rilevato automaticamente
   recentRepos: [],
   lastRepo: null,
 };
@@ -59,6 +60,7 @@ class Settings {
       hasToken: !!this.getToken(),
       useTokenForGit: this.data.useTokenForGit,
       gitPath: this.data.gitPath,
+      editorPath: this.data.editorPath,
       encryptionAvailable: this.encryptionAvailable,
     };
   }
