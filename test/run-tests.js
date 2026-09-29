@@ -337,6 +337,98 @@ async function t(name, fn) {
     await git.pull(repo, null);
     await git.checkout(repo, 'feat/e');
   });
+  console.log('Azioni sui commit della cronologia');
+  await t('revert di un commit', async () => {
+    await git.checkout(repo, 'main');
+    w('r.txt', 'riga\n'); await commitAll('Aggiunge r');
+    const [c] = await git.log(repo, { limit: 1 });
+    assert.strictEqual((await git.revertCommit(repo, c.sha)).conflicts, false);
+    assert.ok(!fs.existsSync(path.join(repo, 'r.txt')));
+    const [last] = await git.log(repo, { limit: 1 });
+    assert.match(last.subject, /^Revert "Aggiunge r"/);
+  });
+  await t('revert con conflitto, completamento dal commit', async () => {
+    w('k.txt', 'uno\n'); await commitAll('K1');
+    const [k1] = await git.log(repo, { limit: 1 });
+    w('k.txt', 'due\n'); await commitAll('K2');
+    assert.ok((await git.revertCommit(repo, k1.sha)).conflicts);
+    const s = await git.status(repo);
+    assert.strictEqual(s.state, 'reverting');
+    const msg = await git.pendingMessage(repo);
+    w('k.txt', 'risolto\n');
+    await git.commit(repo, { paths: ['k.txt'], summary: msg.summary });
+    assert.strictEqual((await git.status(repo)).state, null);
+  });
+  await t('annulla un cherry-pick in conflitto', async () => {
+    await git.createBranch(repo, 'feat/cp');
+    w('k.txt', 'versione cp\n'); await commitAll('CP');
+    const [cp] = await git.log(repo, { limit: 1 });
+    await git.checkout(repo, 'main');
+    w('k.txt', 'versione main\n'); await commitAll('M-K');
+    assert.ok((await git.cherryPick(repo, cp.sha)).conflicts);
+    assert.strictEqual((await git.status(repo)).state, 'cherry-picking');
+    await git.abortMerge(repo);
+    assert.strictEqual((await git.status(repo)).state, null);
+  });
+  await t('cherry-pick pulito', async () => {
+    await git.checkout(repo, 'feat/cp');
+    w('solo-cp.txt', 'x\n'); await commitAll('Solo CP');
+    const [c] = await git.log(repo, { limit: 1 });
+    await git.checkout(repo, 'main');
+    assert.strictEqual((await git.cherryPick(repo, c.sha)).conflicts, false);
+    assert.ok(fs.existsSync(path.join(repo, 'solo-cp.txt')));
+  });
+  await t('tag su un commit e tag visibili nella cronologia', async () => {
+    const [c] = await git.log(repo, { limit: 1 });
+    assert.strictEqual(await git.createTag(repo, 'v1.0.0', c.sha, 'Prima versione'), 'v1.0.0');
+    await git.createTag(repo, 'leggero', c.sha);
+    assert.deepStrictEqual((await git.tagsAt(repo, c.sha)).sort(), ['leggero', 'v1.0.0']);
+    const [again] = await git.log(repo, { limit: 1 });
+    assert.deepStrictEqual(again.tags.sort(), ['leggero', 'v1.0.0']);
+    await assert.rejects(git.createTag(repo, 'v1.0.0', c.sha), /esiste già/);
+    await assert.rejects(git.createTag(repo, 'con spazi', c.sha), /non è un nome di tag valido/);
+    await git.pushTag(repo, 'v1.0.0', null);
+    assert.ok((await git.run(repo, ['ls-remote', '--tags', 'origin'])).includes('refs/tags/v1.0.0'));
+  });
+  await t('reset a un commit non pubblicato', async () => {
+    await git.push(repo, null);
+    const [base] = await git.log(repo, { limit: 1 });
+    w('l1.txt', '1\n'); await commitAll('L1');
+    w('l2.txt', '2\n'); await commitAll('L2');
+    assert.deepStrictEqual(await git.commitsAfter(repo, base.sha), { count: 2, pushed: 0 });
+    assert.strictEqual(await git.resetToCommit(repo, base.sha), 2);
+    const s = await git.status(repo);
+    assert.deepStrictEqual(s.files.map((f) => f.path).sort(), ['l1.txt', 'l2.txt'], 'le modifiche restano nei file');
+    const first = (await git.run(repo, ['rev-list', '--max-parents=0', 'HEAD'])).trim().split('\n')[0];
+    await assert.rejects(git.resetToCommit(repo, first), /già sul server/);
+    await git.discard(repo, s.files);
+  });
+  await t('riordina e unisci commit', async () => {
+    w('o1.txt', '1\n'); await commitAll('O1');
+    w('o2.txt', '2\n'); await commitAll('O2');
+    w('o3.txt', '3\n'); await commitAll('O3');
+    const all = await git.log(repo, { limit: 3 });
+    const [o3, o2, o1] = all;
+    const cand = await git.reorderCandidates(repo, o1.sha);
+    assert.deepStrictEqual(cand.commits.map((c) => c.subject), ['O1', 'O2', 'O3']);
+    // nuovo ordine: O3, O1, e O2 unito a O1
+    const r = await git.rewriteCommits(repo, o1.sha, [{ sha: o3.sha, action: 'pick' }, { sha: o1.sha, action: 'pick' }, { sha: o2.sha, action: 'squash' }]);
+    assert.strictEqual(r.conflicts, false);
+    const after = await git.log(repo, { limit: 2 });
+    assert.strictEqual(after[1].subject, 'O3');
+    assert.strictEqual(after[0].subject, 'O1');
+    assert.match(after[0].body, /O2/, 'il messaggio unito contiene anche O2');
+    assert.strictEqual((await git.status(repo)).files.length, 0);
+    for (const f of ['o1.txt', 'o2.txt', 'o3.txt']) assert.ok(fs.existsSync(path.join(repo, f)));
+  });
+  await t('checkout di un commit (HEAD staccato)', async () => {
+    const [, prev] = await git.log(repo, { limit: 2 });
+    await git.checkoutCommit(repo, prev.sha);
+    const s = await git.status(repo);
+    assert.strictEqual(s.branch, null);
+    assert.strictEqual(s.oid, prev.sha);
+    await git.checkout(repo, 'feat/e');
+  });
   await t('branch principale del remote', async () => {
     assert.strictEqual(await git.remoteDefaultBranch(repo), 'main');
   });

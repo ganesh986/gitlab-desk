@@ -96,11 +96,22 @@ function buildMenu() {
         { label: 'Modifiche', accelerator: 'CmdOrCtrl+1', click: send('tab-changes') },
         { label: 'Cronologia', accelerator: 'CmdOrCtrl+2', click: send('tab-history') },
         { label: 'Merge request', accelerator: 'CmdOrCtrl+3', click: send('tab-mrs') },
+        { label: 'Elenco repository', accelerator: 'CmdOrCtrl+T', click: send('repo-list') },
+        { label: 'Elenco branch', accelerator: 'CmdOrCtrl+B', enabled: repo, click: send('branch-list') },
+        { type: 'separator' },
+        { label: 'Vai al titolo del commit', accelerator: 'CmdOrCtrl+G', enabled: repo, click: send('focus-summary') },
+        { label: 'Mostra le modifiche accantonate', accelerator: isMac ? 'Cmd+Alt+H' : 'Ctrl+H', enabled: repo && !!st.hasStash, click: send('show-stash') },
+        { label: st.filterVisible ? 'Nascondi il filtro dei file' : 'Mostra il filtro dei file', accelerator: 'CmdOrCtrl+L', enabled: repo, click: send('toggle-filter') },
+        { role: 'togglefullscreen', label: 'Schermo intero', accelerator: isMac ? 'Ctrl+Cmd+F' : 'F11' },
+        { type: 'separator' },
+        { role: 'resetZoom', label: 'Dimensione reale', accelerator: 'CmdOrCtrl+0' },
+        { role: 'zoomIn', label: 'Ingrandisci', accelerator: 'CmdOrCtrl+=' },
+        { role: 'zoomOut', label: 'Riduci', accelerator: 'CmdOrCtrl+-' },
+        { label: 'Allarga il pannello laterale', accelerator: 'CmdOrCtrl+9', click: send('side-wider') },
+        { label: 'Restringi il pannello laterale', accelerator: 'CmdOrCtrl+8', click: send('side-narrower') },
         { type: 'separator' },
         { role: 'reload', label: 'Ricarica', accelerator: 'F5' },
-        { role: 'toggleDevTools', label: 'Strumenti sviluppatore' },
-        { type: 'separator' },
-        { role: 'resetZoom', label: 'Dimensione reale' }, { role: 'zoomIn', label: 'Ingrandisci' }, { role: 'zoomOut', label: 'Riduci' },
+        { role: 'toggleDevTools', label: 'Strumenti sviluppatore', accelerator: isMac ? 'Alt+Cmd+I' : 'Ctrl+Shift+I' },
       ],
     },
     {
@@ -351,6 +362,41 @@ handle('git:rebaseAbort', () => git.rebaseAbort(requireRepo()));
 handle('git:pendingMessage', () => git.pendingMessage(requireRepo()));
 handle('git:forcePush', () => git.forcePush(requireRepo(), gitAuth()));
 handle('git:markers', (rels) => git.filesWithMarkers(requireRepo(), rels));
+handle('git:commitsAfter', (sha) => git.commitsAfter(requireRepo(), sha));
+handle('git:resetToCommit', (sha) => git.resetToCommit(requireRepo(), sha));
+handle('git:checkoutCommit', (sha) => git.checkoutCommit(requireRepo(), sha));
+handle('git:revertCommit', (sha) => git.revertCommit(requireRepo(), sha));
+handle('git:cherryPick', (sha) => git.cherryPick(requireRepo(), sha));
+handle('git:createTag', ({ name, sha, message, push }) => (async () => {
+  const tag = await git.createTag(requireRepo(), name, sha, message);
+  if (push) await git.pushTag(requireRepo(), tag, gitAuth());
+  return tag;
+})());
+handle('git:reorderCandidates', (sha) => git.reorderCandidates(requireRepo(), sha));
+handle('git:rewriteCommits', ({ fromSha, plan }) => git.rewriteCommits(requireRepo(), fromSha, plan));
+
+// Menu con il tasto destro su un commit della cronologia
+handle('history:contextMenu', ({ commit, isHead, unpushedAfter, onBranch, hasProject, inProgress }) => new Promise((resolve) => {
+  let settled = false;
+  const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+  const act = (action) => () => done({ action });
+  const tags = commit.tags || [];
+  const template = [
+    { label: 'Riporta il branch a questo commit…', enabled: onBranch && !isHead && unpushedAfter && !inProgress, click: act('reset') },
+    { label: 'Checkout del commit', enabled: !inProgress, click: act('checkout') },
+    { label: 'Riordina i commit…', enabled: onBranch && !inProgress && !commit.isMerge, click: act('reorder') },
+    { label: 'Annulla le modifiche del commit (revert)', enabled: onBranch && !inProgress, click: act('revert') },
+    { type: 'separator' },
+    { label: 'Crea un branch da questo commit…', enabled: !inProgress, click: act('branch') },
+    { label: 'Crea un tag…', click: act('tag') },
+    { label: 'Cherry-pick del commit…', enabled: !inProgress, click: act('cherry-pick') },
+    { type: 'separator' },
+    { label: 'Copia SHA', click: () => { clipboard.writeText(commit.sha); done({ action: 'copied', what: 'SHA' }); } },
+    { label: tags.length > 1 ? `Copia tag (${tags.join(', ')})` : 'Copia tag', enabled: tags.length > 0, click: () => { clipboard.writeText(tags.join('\n')); done({ action: 'copied', what: 'tag' }); } },
+    { label: 'Mostra su GitLab', enabled: hasProject, click: act('gitlab') },
+  ];
+  Menu.buildFromTemplate(template).popup({ window: win, callback: () => setTimeout(() => done(null), 50) });
+}));
 handle('git:fetch', () => git.fetch(requireRepo(), gitAuth()));
 handle('git:defaultBranch', () => git.remoteDefaultBranch(requireRepo()));
 handle('git:pull', () => git.pull(requireRepo(), gitAuth()));

@@ -14,6 +14,8 @@ const channels = [
   'git:renameBranch', 'git:deleteCurrentBranch', 'git:stash', 'git:stashList', 'git:stashFiles', 'git:stashDetails', 'git:stashFileDiff', 'git:stashPop', 'git:stashDrop',
   'git:compare', 'git:mergePreview', 'git:merge', 'git:abortMerge', 'git:rebase', 'git:rebaseContinue', 'git:rebaseAbort',
   'git:commitFiles', 'git:commitFileDiff', 'clipboard:write',
+  'git:commitsAfter', 'git:resetToCommit', 'git:checkoutCommit', 'git:revertCommit', 'git:cherryPick', 'git:createTag',
+  'git:reorderCandidates', 'git:rewriteCommits', 'history:contextMenu',
   'git:pendingMessage', 'git:forcePush', 'git:markers',
   'shell:open', 'dialog:pickFile', 'files:contextMenu', 'files:openInEditor',
 ];

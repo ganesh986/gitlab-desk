@@ -601,3 +601,22 @@ table.diff tr.note td { color: var(--faint); font-style: italic; }
 .stash-bar .chev { color: var(--muted); font-size: 16px; line-height: 1; }
 .stash-bar .grow { flex: 1; }
 .commit-head .meta select { padding: 2px 6px; font-size: 12px; }
+
+/* ------------------------------------------------------------------ tag, filtro, riordino */
+.badge-tag { font-size: 11px; padding: 0 6px; border-radius: 9px; background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); font-family: var(--mono); font-weight: 600; }
+.file-filter { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.file-filter input { flex: 1; min-width: 0; }
+.reorder-list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; max-height: 52vh; overflow-y: auto; }
+.reorder-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--panel); cursor: grab; }
+.reorder-row + .reorder-row { border-top: 1px solid var(--line); }
+.reorder-row .grow { flex: 1; min-width: 0; }
+.reorder-row .subject { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reorder-row .grip { color: var(--faint); letter-spacing: -2px; }
+.reorder-row.dragging { opacity: .45; }
+.reorder-row.over { box-shadow: inset 0 2px 0 var(--accent); }
+.reorder-row.squashed { background: color-mix(in srgb, var(--accent) 7%, var(--panel)); padding-left: 28px; }
+.squash-toggle { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
+.squash-toggle input { accent-color: var(--accent); }
+.icon-btn:disabled { opacity: .3; }
+.commit-row .meta { flex-wrap: wrap; row-gap: 3px; }
+.commit-row .meta > span { white-space: nowrap; }

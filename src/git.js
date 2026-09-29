@@ -236,8 +236,10 @@ async function looksRebased(cwd, upstream) {
 async function repoState(cwd) {
   try {
     const gitDir = (await run(cwd, ['rev-parse', '--absolute-git-dir'])).trim();
-    if (fs.existsSync(path.join(gitDir, 'MERGE_HEAD'))) return 'merging';
     if (fs.existsSync(path.join(gitDir, 'rebase-merge')) || fs.existsSync(path.join(gitDir, 'rebase-apply'))) return 'rebasing';
+    if (fs.existsSync(path.join(gitDir, 'MERGE_HEAD'))) return 'merging';
+    if (fs.existsSync(path.join(gitDir, 'REVERT_HEAD'))) return 'reverting';
+    if (fs.existsSync(path.join(gitDir, 'CHERRY_PICK_HEAD'))) return 'cherry-picking';
   } catch { /* ignore */ }
   return null;
 }
@@ -329,7 +331,7 @@ async function commit(cwd, { paths, summary, description, amend = false }) {
   if (!summary || !summary.trim()) throw new GitError('Scrivi un titolo per il commit.');
   const state = await repoState(cwd);
   if (state === 'rebasing') throw new GitError('È in corso un rebase: usa "Continua rebase" invece del commit.');
-  if (state === 'merging') return commitMerge(cwd, { paths: paths || [], summary, description });
+  if (['merging', 'reverting', 'cherry-picking'].includes(state)) return commitMerge(cwd, { paths: paths || [], summary, description });
   if (!amend && (!paths || !paths.length)) throw new GitError('Seleziona almeno un file da includere nel commit.');
   if (paths && paths.length) assertNoMarkers(cwd, paths);
   const head = await hasHead(cwd);
@@ -391,12 +393,13 @@ const RS = '\x1e';
 
 async function log(cwd, { limit = 100, skip = 0, range } = {}) {
   if (!(await hasHead(cwd))) return [];
-  const args = ['log', `--format=%H${US}%h${US}%an${US}%ae${US}%aI${US}%s${US}%b${RS}`, `-n${limit}`, `--skip=${skip}`];
+  const args = ['log', '--decorate=full', `--format=%H${US}%h${US}%an${US}%ae${US}%aI${US}%s${US}%D${US}%P${US}%b${RS}`, `-n${limit}`, `--skip=${skip}`];
   if (range) args.push(range);
   const out = await run(cwd, args);
   return out.split(RS).map((r) => r.replace(/^\n/, '')).filter(Boolean).map((r) => {
-    const [sha, short, author, email, date, subject, body] = r.split(US);
-    return { sha, short, author, email, date, subject, body: (body || '').trim() };
+    const [sha, short, author, email, date, subject, refs, parents, body] = r.split(US);
+    const tags = (refs || '').split(', ').filter((x) => x.startsWith('tag: refs/tags/')).map((x) => x.slice('tag: refs/tags/'.length));
+    return { sha, short, author, email, date, subject, body: (body || '').trim(), tags, isMerge: (parents || '').trim().split(' ').length > 1 };
   });
 }
 
@@ -652,7 +655,7 @@ async function mergePreview(cwd, branch) {
 
 async function ensureClean(cwd, what) {
   const s = await status(cwd);
-  if (s.state) throw new GitError(`C'è già un ${s.state === 'merging' ? 'merge' : 'rebase'} in corso: completalo o annullalo prima.`);
+  if (s.state) throw new GitError(`C'è già un ${STATE_LABEL[s.state] || 'operazione'} in corso: completalo o annullalo prima.`);
   if (s.files.length) {
     const e = new GitError(`Hai ${s.files.length} file con modifiche non committate. Prima di ${what} fai commit oppure accantona le modifiche (stash).`);
     e.code = 'DIRTY';
@@ -676,10 +679,150 @@ async function merge(cwd, branch, { squash = false } = {}) {
   }
 }
 
+const STATE_LABEL = { merging: 'merge', rebasing: 'rebase', reverting: 'revert', 'cherry-picking': 'cherry-pick' };
+
+// Annulla l'operazione in corso (merge, revert, cherry-pick, rebase)
 async function abortMerge(cwd) {
   const state = await repoState(cwd);
   if (state === 'merging') await run(cwd, ['merge', '--abort']);
+  else if (state === 'reverting') await run(cwd, ['revert', '--abort']);
+  else if (state === 'cherry-picking') await run(cwd, ['cherry-pick', '--abort']);
+  else if (state === 'rebasing') await run(cwd, ['rebase', '--abort']);
   else await run(cwd, ['reset', '--merge']); // squash con conflitti: non c'è MERGE_HEAD
+}
+
+// ---------------------------------------------------------------------------
+// Azioni su un commit della cronologia
+
+async function isMergeCommit(cwd, sha) {
+  return (await parentOf(cwd, sha)).isMerge;
+}
+
+// Commit successivi a sha sul branch attuale, e quanti di questi sono già sul server
+async function commitsAfter(cwd, sha) {
+  checkSha(sha);
+  const isAncestor = await run(cwd, ['merge-base', '--is-ancestor', sha, 'HEAD']).then(() => true, () => false);
+  if (!isAncestor) return null;
+  const all = (await run(cwd, ['rev-list', `${sha}..HEAD`])).split('\n').filter(Boolean);
+  const local = (await run(cwd, ['rev-list', `${sha}..HEAD`, '--not', '--remotes=origin'])).split('\n').filter(Boolean);
+  return { count: all.length, pushed: all.length - local.length };
+}
+
+// Riporta il branch a un commit: i commit successivi spariscono, le loro modifiche restano nei file
+async function resetToCommit(cwd, sha) {
+  const after = await commitsAfter(cwd, sha);
+  if (!after) throw new GitError('Il commit non fa parte del branch attuale.');
+  if (!after.count) throw new GitError('Il branch è già su questo commit.');
+  if (after.pushed) throw new GitError(`${after.pushed} dei commit successivi sono già sul server: non si possono togliere con un reset. Usa "Annulla le modifiche del commit" (revert).`);
+  const s = await status(cwd);
+  if (s.state) throw new GitError(`C'è un ${STATE_LABEL[s.state]} in corso: completalo o annullalo prima.`);
+  await run(cwd, ['reset', '--mixed', '-q', sha]);
+  return after.count;
+}
+
+async function checkoutCommit(cwd, sha) {
+  checkSha(sha);
+  await run(cwd, ['switch', '--detach', sha]);
+}
+
+async function revertCommit(cwd, sha) {
+  checkSha(sha);
+  await ensureClean(cwd, 'annullare un commit');
+  const args = ['revert', '--no-edit'];
+  if (await isMergeCommit(cwd, sha)) args.push('-m', '1');
+  args.push(sha);
+  try { await run(cwd, args); return { conflicts: false }; }
+  catch (e) {
+    const s = await status(cwd);
+    if (s.conflicts) return { conflicts: true, count: s.conflicts };
+    throw e;
+  }
+}
+
+async function cherryPick(cwd, sha) {
+  checkSha(sha);
+  await ensureClean(cwd, 'fare il cherry-pick');
+  const args = ['cherry-pick'];
+  if (await isMergeCommit(cwd, sha)) args.push('-m', '1');
+  args.push(sha);
+  try { await run(cwd, args); return { conflicts: false }; }
+  catch (e) {
+    const s = await status(cwd);
+    if (s.conflicts) return { conflicts: true, count: s.conflicts };
+    if (/empty|nothing to commit|allow-empty/i.test(e.stderr || '')) {
+      await run(cwd, ['cherry-pick', '--abort']).catch(() => {});
+      throw new GitError('Le modifiche di questo commit sono già presenti nel branch: non c\'è niente da applicare.');
+    }
+    throw e;
+  }
+}
+
+async function tagsAt(cwd, sha) {
+  checkSha(sha);
+  return (await run(cwd, ['tag', '--points-at', sha])).split('\n').filter(Boolean);
+}
+
+async function createTag(cwd, name, sha, message) {
+  checkSha(sha);
+  const clean = (name || '').trim();
+  try { await run(cwd, ['check-ref-format', `refs/tags/${clean}`]); }
+  catch { throw new GitError(`"${clean}" non è un nome di tag valido. Evita spazi e caratteri speciali (es. v1.2.0).`); }
+  const exists = await run(cwd, ['rev-parse', '--verify', '-q', `refs/tags/${clean}`]).then(() => true, () => false);
+  if (exists) throw new GitError(`Il tag ${clean} esiste già.`);
+  if (message && message.trim()) await run(cwd, ['tag', '-a', clean, '-F', '-', sha], { input: message.trim() + '\n' });
+  else await run(cwd, ['tag', clean, sha]);
+  return clean;
+}
+
+async function pushTag(cwd, name, auth) {
+  const url = await remoteUrl(cwd);
+  await run(cwd, ['push', 'origin', `refs/tags/${name}:refs/tags/${name}`], { env: authEnv(url, auth) });
+}
+
+// Commit riordinabili: da sha fino a HEAD (al massimo 50), senza commit di merge
+async function reorderCandidates(cwd, sha) {
+  const after = await commitsAfter(cwd, sha);
+  if (!after) throw new GitError('Il commit non fa parte del branch attuale.');
+  const commits = await log(cwd, { limit: 51, range: `${sha}~1..HEAD` }).catch(async () => log(cwd, { limit: 51, range: 'HEAD' }));
+  if (commits.length > 50) throw new GitError('Si possono riordinare al massimo 50 commit alla volta: scegli un commit più recente.');
+  if (commits.some((c) => c.isMerge)) throw new GitError('Tra questi commit c\'è un commit di merge: il riordino funziona solo su una cronologia lineare.');
+  const local = new Set((await run(cwd, ['rev-list', 'HEAD', '--not', '--remotes=origin'])).split('\n').filter(Boolean));
+  return { commits: commits.reverse().map((c) => ({ ...c, pushed: !local.has(c.sha) })) }; // dal più vecchio al più recente
+}
+
+/**
+ * Riscrive i commit da fromSha a HEAD nell'ordine dato (dal più vecchio al più recente).
+ * plan: [{ sha, action: 'pick' | 'squash' }] — 'squash' unisce il commit al precedente nella lista.
+ */
+async function rewriteCommits(cwd, fromSha, plan) {
+  if (!plan.length) return { conflicts: false };
+  checkSha(fromSha);
+  plan.forEach((p) => checkSha(p.sha));
+  if (plan[0].action === 'squash') throw new GitError('Il primo commit della lista non può essere unito a un commit precedente.');
+  await ensureClean(cwd, 'riordinare i commit');
+  const { commits } = await reorderCandidates(cwd, fromSha);
+  const known = new Set(commits.map((c) => c.sha));
+  if (plan.length !== commits.length || !plan.every((p) => known.has(p.sha))) throw new GitError('L\'elenco dei commit è cambiato nel frattempo: riapri la finestra.');
+  const oldest = commits[0].sha;
+  const { parent } = await parentOf(cwd, oldest);
+  const todo = plan.map((p) => `${p.action === 'squash' ? 'squash' : 'pick'} ${p.sha}`).join('\n') + '\n';
+  const tmp = path.join(require('os').tmpdir(), `gitlab-desk-todo-${process.pid}-${Date.now()}.txt`);
+  fs.writeFileSync(tmp, todo);
+  // Git apre il "sequence editor" passandogli il file della lista: lo sostituiamo con la nostra
+  const editor = `cp "${tmp.replace(/\\/g, '/')}"`;
+  const env = { GIT_SEQUENCE_EDITOR: editor, GIT_EDITOR: 'true' };
+  const args = ['rebase', '-i', '--no-autosquash'];
+  args.push(parent || '--root');
+  try {
+    await run(cwd, args, { env });
+    return { conflicts: false };
+  } catch (e) {
+    const s = await status(cwd);
+    if (s.state === 'rebasing') return { conflicts: true, count: s.conflicts };
+    throw e;
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
 }
 
 const NO_EDITOR = { GIT_EDITOR: 'true', GIT_SEQUENCE_EDITOR: 'true' };
@@ -770,4 +913,6 @@ module.exports = {
   pendingMessage, filesWithMarkers, renameBranch, deleteRemoteBranch,
   stashAll, stashList, stashFiles, stashDetails, stashFileDiff, stashPop, stashDrop,
   compare, mergePreview, merge, abortMerge, rebase, rebaseContinue, rebaseAbort,
+  commitsAfter, resetToCommit, checkoutCommit, revertCommit, cherryPick, tagsAt, createTag, pushTag,
+  reorderCandidates, rewriteCommits, STATE_LABEL,
 };
