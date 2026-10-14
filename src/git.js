@@ -757,6 +757,59 @@ async function cherryPick(cwd, sha) {
   }
 }
 
+// Un commit è "solo locale" se nessun branch del server lo contiene
+async function isLocalOnly(cwd, sha) {
+  checkSha(sha);
+  const out = await run(cwd, ['rev-list', '-n', '1', sha, '--not', '--remotes=origin']);
+  return out.trim().length > 0;
+}
+
+/**
+ * Rimuove un commit mai pubblicato.
+ * Se è l'ultimo commit: keepChanges=true lascia le sue modifiche nei file, false le elimina.
+ * Se è più vecchio: viene tolto dalla cronologia (con le sue modifiche) e i commit successivi riapplicati.
+ */
+async function dropCommit(cwd, sha, { keepChanges = true } = {}) {
+  checkSha(sha);
+  const s = await status(cwd);
+  if (!s.branch) throw new GitError('Non sei su un branch.');
+  if (s.state) throw new GitError(`C'è un ${STATE_LABEL[s.state]} in corso: completalo o annullalo prima.`);
+  if (!(await isLocalOnly(cwd, sha))) throw new GitError('Questo commit è già sul server: non si può rimuovere senza riscrivere la cronologia condivisa. Usa "Annulla le modifiche del commit (revert)".');
+  const after = await commitsAfter(cwd, sha);
+  if (!after) throw new GitError('Il commit non fa parte del branch attuale.');
+  const { parent, isMerge } = await parentOf(cwd, sha);
+  if (isMerge) throw new GitError('I commit di merge non si possono rimuovere da qui.');
+  if (!parent) throw new GitError('È il primo commit del repository: non si può rimuovere.');
+  if (after.count === 0) {
+    // ultimo commit del branch
+    if (keepChanges) await run(cwd, ['reset', '--mixed', '-q', parent]);
+    else await run(cwd, ['reset', '--keep', '-q', parent]);
+    return { conflicts: false, wasLast: true };
+  }
+  const { commits } = await reorderCandidates(cwd, sha);
+  return rewriteCommits(cwd, sha, commits.map((c) => ({ sha: c.sha, action: c.sha === sha ? 'drop' : 'pick' })));
+}
+
+/**
+ * Sposta i commit non pubblicati del branch attuale su un branch nuovo e riporta il branch
+ * attuale com'è sul server. Le modifiche non committate seguono sul nuovo branch.
+ */
+async function moveLocalCommits(cwd, newName) {
+  const s = await status(cwd);
+  if (!s.branch) throw new GitError('Non sei su un branch.');
+  if (s.state) throw new GitError(`C'è un ${STATE_LABEL[s.state]} in corso: completalo o annullalo prima.`);
+  if (!s.upstream) throw new GitError(`Il branch ${s.branch} non è mai stato pubblicato: puoi semplicemente rinominarlo (menu Branch → Rinomina).`);
+  if (!s.ahead) throw new GitError(`Su ${s.branch} non ci sono commit locali da spostare.`);
+  const valid = await validateBranchName(cwd, newName);
+  const exists = await run(cwd, ['rev-parse', '--verify', '-q', `refs/heads/${valid}`]).then(() => true, () => false);
+  if (exists) throw new GitError(`Esiste già un branch chiamato ${valid}.`);
+  const from = s.branch;
+  await run(cwd, ['switch', '--no-track', '-c', valid]);
+  // il branch di partenza torna a coincidere con il server
+  await run(cwd, ['branch', '-f', from, s.upstream]);
+  return { name: valid, from, moved: s.ahead, upstream: s.upstream };
+}
+
 async function tagsAt(cwd, sha) {
   checkSha(sha);
   return (await run(cwd, ['tag', '--points-at', sha])).split('\n').filter(Boolean);
@@ -798,14 +851,16 @@ async function rewriteCommits(cwd, fromSha, plan) {
   if (!plan.length) return { conflicts: false };
   checkSha(fromSha);
   plan.forEach((p) => checkSha(p.sha));
-  if (plan[0].action === 'squash') throw new GitError('Il primo commit della lista non può essere unito a un commit precedente.');
+  const firstKept = plan.find((p) => p.action !== 'drop');
+  if (firstKept && firstKept.action === 'squash') throw new GitError('Il primo commit della lista non può essere unito a un commit precedente.');
   await ensureClean(cwd, 'riordinare i commit');
   const { commits } = await reorderCandidates(cwd, fromSha);
   const known = new Set(commits.map((c) => c.sha));
   if (plan.length !== commits.length || !plan.every((p) => known.has(p.sha))) throw new GitError('L\'elenco dei commit è cambiato nel frattempo: riapri la finestra.');
   const oldest = commits[0].sha;
   const { parent } = await parentOf(cwd, oldest);
-  const todo = plan.map((p) => `${p.action === 'squash' ? 'squash' : 'pick'} ${p.sha}`).join('\n') + '\n';
+  const word = { squash: 'squash', drop: 'drop' };
+  const todo = plan.map((p) => `${word[p.action] || 'pick'} ${p.sha}`).join('\n') + '\n';
   const tmp = path.join(require('os').tmpdir(), `gitlab-desk-todo-${process.pid}-${Date.now()}.txt`);
   fs.writeFileSync(tmp, todo);
   // Git apre il "sequence editor" passandogli il file della lista: lo sostituiamo con la nostra
@@ -914,5 +969,5 @@ module.exports = {
   stashAll, stashList, stashFiles, stashDetails, stashFileDiff, stashPop, stashDrop,
   compare, mergePreview, merge, abortMerge, rebase, rebaseContinue, rebaseAbort,
   commitsAfter, resetToCommit, checkoutCommit, revertCommit, cherryPick, tagsAt, createTag, pushTag,
-  reorderCandidates, rewriteCommits, STATE_LABEL,
+  reorderCandidates, rewriteCommits, STATE_LABEL, isLocalOnly, dropCommit, moveLocalCommits,
 };

@@ -151,6 +151,7 @@ function buildMenu() {
         { label: 'Squash e unisci nel branch attuale…', accelerator: 'CmdOrCtrl+Shift+H', enabled: onBranch && !busy, click: send('squash-merge') },
         { label: 'Rebase del branch attuale…', accelerator: 'CmdOrCtrl+Shift+E', enabled: onBranch && !busy, click: send('rebase') },
         { type: 'separator' },
+        { label: 'Sposta i commit locali su un nuovo branch…', enabled: onBranch && !busy && !!st.published && !!st.ahead, click: send('move-local') },
         { label: `Unisci in ${def} e pubblica…`, accelerator: 'CmdOrCtrl+Shift+I', enabled: onBranch && !busy && !st.isDefault && !!st.defaultBranch, click: send('integrate-default') },
         { type: 'separator' },
         { label: 'Confronta su GitLab', accelerator: 'CmdOrCtrl+Shift+C', enabled: onBranch && !!st.onGitlab && !!st.published, click: send('compare-gitlab') },
@@ -373,10 +374,12 @@ handle('git:createTag', ({ name, sha, message, push }) => (async () => {
   return tag;
 })());
 handle('git:reorderCandidates', (sha) => git.reorderCandidates(requireRepo(), sha));
+handle('git:dropCommit', ({ sha, keepChanges }) => git.dropCommit(requireRepo(), sha, { keepChanges }));
+handle('git:moveLocalCommits', (name) => git.moveLocalCommits(requireRepo(), name));
 handle('git:rewriteCommits', ({ fromSha, plan }) => git.rewriteCommits(requireRepo(), fromSha, plan));
 
 // Menu con il tasto destro su un commit della cronologia
-handle('history:contextMenu', ({ commit, isHead, unpushedAfter, onBranch, hasProject, inProgress }) => new Promise((resolve) => {
+handle('history:contextMenu', ({ commit, isHead, isLocal, unpushedAfter, onBranch, hasProject, inProgress, localCount }) => new Promise((resolve) => {
   let settled = false;
   const done = (v) => { if (!settled) { settled = true; resolve(v); } };
   const act = (action) => () => done({ action });
@@ -386,7 +389,9 @@ handle('history:contextMenu', ({ commit, isHead, unpushedAfter, onBranch, hasPro
     { label: 'Checkout del commit', enabled: !inProgress, click: act('checkout') },
     { label: 'Riordina i commit…', enabled: onBranch && !inProgress && !commit.isMerge, click: act('reorder') },
     { label: 'Annulla le modifiche del commit (revert)', enabled: onBranch && !inProgress, click: act('revert') },
+    { label: 'Rimuovi il commit (solo locale)…', enabled: onBranch && !inProgress && isLocal && !commit.isMerge, click: act('drop') },
     { type: 'separator' },
+    { label: localCount ? `Sposta ${localCount === 1 ? 'il commit locale' : `i ${localCount} commit locali`} su un nuovo branch…` : 'Sposta i commit locali su un nuovo branch…', enabled: onBranch && !inProgress && !!localCount, click: act('move') },
     { label: 'Crea un branch da questo commit…', enabled: !inProgress, click: act('branch') },
     { label: 'Crea un tag…', click: act('tag') },
     { label: 'Cherry-pick del commit…', enabled: !inProgress, click: act('cherry-pick') },

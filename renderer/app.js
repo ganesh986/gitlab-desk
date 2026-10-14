@@ -88,6 +88,7 @@ function bindChrome() {
       'new-branch': () => openNewBranch(),
       'new-mr': () => { if (S.branchMr) { S.mrView = { kind: 'detail', iid: S.branchMr.iid }; switchTab('mrs'); } else openNewMr(); },
       'force-push': () => forcePush(),
+      'move-local': openMoveLocalCommits,
       'workflow-mr': () => setWorkflow('mr'),
       'workflow-direct': () => setWorkflow('direct'),
       'integrate-default': integrateIntoDefault,
@@ -664,7 +665,13 @@ function renderChangesOverview() {
   } else if (s.ahead && pushBlocked()) {
     banners.push(banner('warn', `Non puoi fare push su ${s.branch}`,
       `Il branch è protetto in GitLab e il tuo ruolo non può pubblicarci direttamente. Chiedi a un Maintainer di abilitarlo (Settings → Repository → Protected branches → "Allowed to push and merge"), oppure crea un branch di lavoro dai tuoi ${s.ahead} commit e apri una merge request.`,
-      h('button', { class: 'btn', onclick: () => openNewBranch() }, 'Crea branch')));
+      h('button', { class: 'btn primary', onclick: openMoveLocalCommits }, 'Sposta su un nuovo branch')));
+  } else if (s.ahead && s.upstream && workflow() === 'mr' && s.branch === defaultBranch()) {
+    banners.push(banner('accent', `${s.ahead === 1 ? 'Un commit locale' : `${s.ahead} commit locali`} su ${s.branch}`,
+      'Questo progetto lavora con le merge request: puoi spostare i commit su un nuovo branch (e aprire la merge request), oppure pubblicarli direttamente.',
+      h('span', { class: 'inline' },
+        h('button', { class: 'btn primary', onclick: openMoveLocalCommits }, 'Sposta su un nuovo branch'),
+        h('button', { class: 'btn', onclick: (e) => runNet('push', e.currentTarget) }, 'Push'))));
   } else if (s.ahead) {
     banners.push(banner('accent', `${s.ahead} commit da pubblicare`, `Il branch ${s.branch} ha commit che il server non ha ancora.`,
       h('button', { class: 'btn primary', onclick: (e) => runNet('push', e.currentTarget) }, 'Push')));
@@ -1551,6 +1558,7 @@ function syncMenuState() {
     mrIid: S.branchMr ? S.branchMr.iid : null,
     workflow: workflow(),
     hasStash: !!currentStash(),
+    ahead: s && s.upstream ? s.ahead : 0,
     filterVisible: !!S.filterVisible,
   });
 }
@@ -2132,6 +2140,8 @@ async function openCommitMenu(c) {
     commit: { sha: c.sha, tags: c.tags || [], isMerge: !!c.isMerge },
     isHead: c.sha === s.oid,
     unpushedAfter: !!(after && after.count > 0 && after.pushed === 0),
+    isLocal: ((s.unpushed || []).includes(c.sha)),
+    localCount: s.upstream ? s.ahead : 0,
     onBranch: !!s.branch,
     hasProject: !!S.project,
     inProgress: !!s.state,
@@ -2142,6 +2152,8 @@ async function openCommitMenu(c) {
     case 'checkout': return checkoutCommit(c);
     case 'reorder': return openReorder(c);
     case 'revert': return revertCommit(c);
+    case 'drop': return dropLocalCommit(c);
+    case 'move': return openMoveLocalCommits();
     case 'branch': return openNewBranch('', c);
     case 'tag': return openCreateTag(c);
     case 'cherry-pick': return openCherryPick(c);
@@ -2334,6 +2346,94 @@ async function openReorder(c) {
     width: 'min(640px, calc(100vw - 32px))',
   });
   draw();
+}
+
+
+// =========================================================================== rimuovere o spostare commit locali
+
+async function dropLocalCommit(c) {
+  const s = S.status;
+  const isLast = c.sha === s.oid;
+  let keep = true;
+  const result = await new Promise((resolve) => {
+    let out = false;
+    const option = (value, title, text) => h('label', { class: 'choice' + (keep === value ? ' checked' : '') },
+      h('input', { type: 'radio', name: 'drop-choice', checked: keep === value, onchange: () => { keep = value; box.querySelectorAll('.choice').forEach((el) => el.classList.toggle('checked', el.querySelector('input').checked)); } }),
+      h('span', null, h('strong', null, title), h('span', { class: 'sub' }, text)));
+    const box = h('div', { class: 'choices' },
+      option(true, 'Mantieni le modifiche nei file', 'Il commit sparisce, le sue modifiche tornano nel pannello Modifiche: puoi rifare il commit dove vuoi.'),
+      option(false, 'Elimina anche le modifiche', 'Il commit e le sue modifiche vengono eliminati.'));
+    const go = h('button', { class: 'btn primary danger', onclick: () => { out = true; m.close(); } }, 'Rimuovi il commit');
+    const m = modal({
+      title: 'Rimuovere il commit?',
+      body: [
+        h('div', { class: 'status-line' }, `${c.short} — ${c.subject}`),
+        isLast
+          ? box
+          : h('p', { style: 'margin:0' }, 'Il commit verrà tolto dalla cronologia insieme alle sue modifiche; i commit successivi restano. Se dipendono da questo commit potrebbero esserci conflitti da risolvere.'),
+        s.upstream && s.ahead > 0 && h('div', { class: 'sub' }, 'Se invece vuoi solo spostare i commit locali su un altro branch, usa "Sposta i commit locali su un nuovo branch".'),
+      ],
+      footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Annulla'), go],
+      onClose: () => resolve(out),
+    });
+  });
+  if (!result) return;
+  if (!isLast && s.files.length && !(await stashAll())) return;
+  const r = await busy(null, () => api('git:dropCommit', { sha: c.sha, keepChanges: keep }));
+  if (!r) return;
+  S.selectedCommit = null;
+  await refreshStatus();
+  afterHistoryChange();
+  if (r.conflicts) { switchTab('changes'); toast(`Conflitti in ${r.count} file: risolvili e clicca "Continua rebase".`, { type: 'error', timeout: 0 }); return; }
+  toast(isLast && keep ? 'Commit rimosso: le sue modifiche sono nel pannello Modifiche.' : 'Commit rimosso.', { type: 'success', timeout: 6000 });
+}
+
+function openMoveLocalCommits() {
+  const s = S.status;
+  if (!s || !s.branch) return toast('Non sei su un branch.');
+  if (s.state) return toast(`Completa o annulla prima il ${opLabel(s.state)} in corso.`, { type: 'error' });
+  if (!s.upstream) return toast(`${s.branch} non è mai stato pubblicato: per cambiargli nome usa Branch → Rinomina.`);
+  if (!s.ahead) return toast(`Su ${s.branch} non ci sono commit locali da spostare.`);
+  const from = s.branch;
+  const name = h('input', { type: 'text', placeholder: 'es. fix/oneri-recesso' });
+  const publish = h('input', { type: 'checkbox', checked: true });
+  const canMr = !!S.project;
+  const openMr = h('input', { type: 'checkbox', checked: canMr && workflow() === 'mr' });
+  const go = h('button', {
+    class: 'btn primary',
+    onclick: async () => {
+      const n = name.value.trim();
+      if (!n) return name.focus();
+      const r = await busy(go, () => api('git:moveLocalCommits', n));
+      if (!r) return;
+      m.close();
+      await refreshStatus();
+      afterHistoryChange();
+      toast(`${r.moved === 1 ? 'Il commit è stato spostato' : `${r.moved} commit spostati`} su ${r.name}. ${r.from} ora è uguale a ${r.upstream}.`, { type: 'success', timeout: 7000 });
+      if (publish.checked) {
+        const pushed = await busy($('tb-sync'), async () => { await api('git:push'); return true; });
+        await refreshStatus();
+        if (pushed) {
+          await refreshBranchMr();
+          if (canMr && openMr.checked) openNewMr();
+          else toast(`Branch ${r.name} pubblicato.`, { type: 'success' });
+        }
+      }
+    },
+  }, 'Sposta i commit');
+  name.addEventListener('keydown', (e) => { if (e.key === 'Enter') go.click(); });
+  publish.addEventListener('change', () => { openMr.disabled = !publish.checked; if (!publish.checked) openMr.checked = false; });
+  const m = modal({
+    title: 'Sposta i commit locali su un nuovo branch',
+    body: [
+      h('p', { style: 'margin:0' }, `${s.ahead === 1 ? 'Il commit non ancora pubblicato' : `I ${s.ahead} commit non ancora pubblicati`} di ${from} ${s.ahead === 1 ? 'verrà spostato' : 'verranno spostati'} su un nuovo branch, e ${from} tornerà uguale a ${s.upstream}. Le modifiche non committate ti seguono sul nuovo branch.`),
+      h('div', { class: 'field' }, h('label', null, 'Nome del nuovo branch'), name),
+      h('div', { class: 'checks' },
+        h('label', null, publish, 'Pubblica il nuovo branch sul server'),
+        canMr && h('label', null, openMr, 'Poi prepara la merge request')),
+    ],
+    footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Annulla'), go],
+  });
 }
 
 init().catch((e) => toast(`Avvio non riuscito: ${e.message}`, { type: 'error', timeout: 0 }));

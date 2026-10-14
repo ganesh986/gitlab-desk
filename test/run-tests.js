@@ -421,6 +421,52 @@ async function t(name, fn) {
     assert.strictEqual((await git.status(repo)).files.length, 0);
     for (const f of ['o1.txt', 'o2.txt', 'o3.txt']) assert.ok(fs.existsSync(path.join(repo, f)));
   });
+  await t('rimuovi l\'ultimo commit locale mantenendo o eliminando le modifiche', async () => {
+    w('rimuovi.txt', '1\n'); await commitAll('D1');
+    let [c] = await git.log(repo, { limit: 1 });
+    assert.ok(await git.isLocalOnly(repo, c.sha));
+    await git.dropCommit(repo, c.sha, { keepChanges: true });
+    assert.deepStrictEqual((await git.status(repo)).files.map((f) => f.path), ['rimuovi.txt']);
+    await commitAll('D1 di nuovo');
+    [c] = await git.log(repo, { limit: 1 });
+    await git.dropCommit(repo, c.sha, { keepChanges: false });
+    assert.strictEqual((await git.status(repo)).files.length, 0);
+    assert.ok(!fs.existsSync(path.join(repo, 'rimuovi.txt')));
+  });
+  await t('rimuovi un commit locale in mezzo alla cronologia', async () => {
+    w('m1.txt', '1\n'); await commitAll('M1');
+    w('m2.txt', '2\n'); await commitAll('M2');
+    w('m3.txt', '3\n'); await commitAll('M3');
+    const [, m2] = await git.log(repo, { limit: 3 });
+    const r = await git.dropCommit(repo, m2.sha);
+    assert.strictEqual(r.conflicts, false);
+    assert.deepStrictEqual((await git.log(repo, { limit: 2 })).map((x) => x.subject), ['M3', 'M1']);
+    assert.ok(!fs.existsSync(path.join(repo, 'm2.txt')));
+  });
+  await t('un commit già sul server non si rimuove', async () => {
+    await git.push(repo, null);
+    const [c] = await git.log(repo, { limit: 1 });
+    assert.ok(!(await git.isLocalOnly(repo, c.sha)));
+    await assert.rejects(git.dropCommit(repo, c.sha), /già sul server/);
+  });
+  await t('sposta i commit locali su un nuovo branch', async () => {
+    const st0 = await git.status(repo);
+    const serverHead = (await git.run(repo, ['rev-parse', st0.upstream])).trim();
+    w('n1.txt', '1\n'); await commitAll('N1');
+    w('n2.txt', '2\n'); await commitAll('N2');
+    w('in-corso.txt', 'non committato\n');
+    const r = await git.moveLocalCommits(repo, 'fix/spostati');
+    assert.strictEqual(r.moved, 2);
+    const s = await git.status(repo);
+    assert.strictEqual(s.branch, 'fix/spostati');
+    assert.strictEqual(s.upstream, null);
+    assert.deepStrictEqual(s.files.map((f) => f.path), ['in-corso.txt'], 'le modifiche non committate seguono');
+    assert.deepStrictEqual((await git.log(repo, { limit: 2 })).map((x) => x.subject), ['N2', 'N1']);
+    assert.strictEqual((await git.run(repo, ['rev-parse', r.from])).trim(), serverHead, 'il branch di partenza torna come sul server');
+    await assert.rejects(git.moveLocalCommits(repo, 'altro'), /mai stato pubblicato/);
+    await git.discard(repo, s.files);
+    await git.checkout(repo, r.from);
+  });
   await t('checkout di un commit (HEAD staccato)', async () => {
     const [, prev] = await git.log(repo, { limit: 2 });
     await git.checkoutCommit(repo, prev.sha);
