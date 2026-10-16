@@ -620,3 +620,10 @@ table.diff tr.note td { color: var(--faint); font-style: italic; }
 .icon-btn:disabled { opacity: .3; }
 .commit-row .meta { flex-wrap: wrap; row-gap: 3px; }
 .commit-row .meta > span { white-space: nowrap; }
+
+/* ------------------------------------------------------------------ conflitti */
+.kind.resolved { color: var(--add); border-color: var(--add); font-size: 11px; }
+.conflict-bar { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--warn-bg); }
+.conflict-bar.ok { background: var(--add-bg); }
+.conflict-bar .text { flex: 1; min-width: 260px; display: flex; flex-direction: column; gap: 2px; }
+.conflict-bar .text span { color: var(--muted); font-size: 12.5px; }

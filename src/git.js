@@ -174,6 +174,7 @@ function parseStatus(raw) {
       const f = fileEntry(parts[1], parts.slice(10).join(' '));
       f.kind = 'conflict';
       f.conflict = true;
+      f.conflictType = parts[1]; // UU modificato da entrambi, AA aggiunto da entrambi, UD/DU eliminato da una parte
       result.files.push(f);
     } else if (type === '?') {
       result.files.push({ path: line.slice(2), kind: 'added', untracked: true, staged: false });
@@ -196,7 +197,16 @@ async function status(cwd) {
   s.hasHead = !!s.oid;
   await normalizeUpstream(cwd, s);
   s.state = await repoState(cwd);
-  s.conflicts = s.files.filter((f) => f.conflict).length;
+  // unmerged = file che Git considera ancora in conflitto; conflicts = quelli che hanno ancora
+  // bisogno di un intervento (segni di conflitto nel file, oppure eliminato da una parte)
+  const unmerged = s.files.filter((f) => f.conflict);
+  const withMarkers = new Set(filesWithMarkers(cwd, unmerged.map((f) => f.path)));
+  for (const f of unmerged) {
+    const deleteConflict = /D/.test(f.conflictType || '');
+    f.resolved = !deleteConflict && !withMarkers.has(f.path) && fs.existsSync(path.join(cwd, f.path));
+  }
+  s.unmerged = unmerged.length;
+  s.conflicts = unmerged.filter((f) => !f.resolved).length;
   if (s.state === 'rebasing') s.rebaseBranch = await rebaseHeadName(cwd);
   s.rebased = s.upstream && s.ahead && s.behind ? await looksRebased(cwd, s.upstream) : false;
   return s;
@@ -275,17 +285,54 @@ async function pendingMessage(cwd) {
 }
 
 // File che contengono ancora i segni di conflitto (<<<<<<< ======= >>>>>>>)
+// Testo del file anche se salvato in UTF-16 (succede con alcuni editor su Windows)
+function readText(abs) {
+  const buf = fs.readFileSync(abs);
+  if (buf[0] === 0xff && buf[1] === 0xfe) return buf.slice(2).toString('utf16le');
+  if (buf[0] === 0xfe && buf[1] === 0xff) { const b = Buffer.from(buf.slice(2)); b.swap16(); return b.toString('utf16le'); }
+  if (buf.includes(0)) return null; // binario
+  return buf.toString('utf8').replace(/^\uFEFF/, '');
+}
+
+// Un file ha ancora un conflitto se contiene una riga che inizia con <<<<<<< seguita
+// più avanti da una riga che inizia con >>>>>>> (righe con fine Windows o Unix)
 function filesWithMarkers(cwd, rels) {
-  const re = /^<{7}(?: |$)[\s\S]*?^>{7}(?: |$)/m;
   return rels.filter((rel) => {
     try {
       const abs = path.join(cwd, rel);
       const st = fs.statSync(abs);
       if (!st.isFile() || st.size > 20 * 1024 * 1024) return false;
-      const buf = fs.readFileSync(abs);
-      return !buf.includes(0) && re.test(buf.toString('utf8'));
+      const text = readText(abs);
+      if (text === null) return false;
+      const lines = text.split(/\r\n|\n|\r/);
+      const start = lines.findIndex((l) => /^<{7}(\s|$)/.test(l));
+      return start >= 0 && lines.slice(start + 1).some((l) => /^>{7}(\s|$)/.test(l));
     } catch { return false; }
   });
+}
+
+// Risoluzione rapida di un file in conflitto
+async function resolveConflict(cwd, rel, how) {
+  const s = parseStatus(await run(cwd, ['status', '--porcelain=v2', '-z', '--untracked-files=no']));
+  const f = s.files.find((x) => x.path === rel && x.conflict);
+  if (!f) throw new GitError(`${rel} non risulta in conflitto.`);
+  const abs = path.join(cwd, rel);
+  if (how === 'ours' || how === 'theirs') {
+    const stages = (await run(cwd, ['ls-files', '-u', '--', rel])).split('\n').filter(Boolean).map((l) => l.split(/\s+/)[2]);
+    const wanted = how === 'ours' ? '2' : '3';
+    if (stages.includes(wanted)) {
+      await run(cwd, ['checkout', `--${how}`, '--', rel]);
+      await run(cwd, ['add', '--', rel]);
+    } else {
+      // in quella versione il file non esiste più: sceglierla vuol dire eliminarlo
+      await run(cwd, ['rm', '-q', '--', rel]);
+    }
+  } else if (how === 'resolved') {
+    if (fs.existsSync(abs)) await run(cwd, ['add', '--', rel]);
+    else await run(cwd, ['rm', '-q', '--cached', '--', rel]);
+  } else {
+    throw new GitError('Scelta non valida.');
+  }
 }
 
 function assertNoMarkers(cwd, rels) {
@@ -328,10 +375,10 @@ function untrackedDiff(cwd, rel) {
 // Commit: include solo i file selezionati (modello "spunta per includere")
 
 async function commit(cwd, { paths, summary, description, amend = false }) {
-  if (!summary || !summary.trim()) throw new GitError('Scrivi un titolo per il commit.');
   const state = await repoState(cwd);
   if (state === 'rebasing') throw new GitError('È in corso un rebase: usa "Continua rebase" invece del commit.');
   if (['merging', 'reverting', 'cherry-picking'].includes(state)) return commitMerge(cwd, { paths: paths || [], summary, description });
+  if (!summary || !summary.trim()) throw new GitError('Scrivi un titolo per il commit.');
   if (!amend && (!paths || !paths.length)) throw new GitError('Seleziona almeno un file da includere nel commit.');
   if (paths && paths.length) assertNoMarkers(cwd, paths);
   const head = await hasHead(cwd);
@@ -354,9 +401,18 @@ async function commitMerge(cwd, { paths, summary, description }) {
   if (excludedConflicts.length) {
     throw new GitError(`Per completare il merge devi includere anche i file in conflitto: ${excludedConflicts.slice(0, 5).join(', ')}.`);
   }
-  assertNoMarkers(cwd, paths);
+  // i segni di conflitto si controllano solo sui file ancora in conflitto: quelli segnati
+  // come risolti dall'utente vengono accettati così come sono
+  assertNoMarkers(cwd, conflicted);
   if (paths.length) await run(cwd, ['add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: paths.join('\0') });
-  const message = description && description.trim() ? `${summary.trim()}\n\n${description.trim()}\n` : `${summary.trim()}\n`;
+  let title = (summary || '').trim();
+  let body = (description || '').trim();
+  if (!title) {
+    const pending = await pendingMessage(cwd);
+    title = (pending && pending.summary) || 'Merge';
+    if (!body && pending) body = pending.description || '';
+  }
+  const message = body ? `${title}\n\n${body}\n` : `${title}\n`;
   await run(cwd, ['commit', '-F', '-'], { input: message });
   return (await run(cwd, ['rev-parse', '--short', 'HEAD'])).trim();
 }
@@ -621,7 +677,7 @@ async function stashPop(cwd, ref) {
   try { await run(cwd, ['stash', 'pop', ref]); return { conflicts: false }; }
   catch (e) {
     const s = await status(cwd);
-    if (s.conflicts) return { conflicts: true };
+    if (s.unmerged) return { conflicts: true };
     throw e;
   }
 }
@@ -674,7 +730,7 @@ async function merge(cwd, branch, { squash = false } = {}) {
     return { conflicts: false, upToDate: /Already up to date/i.test(out), squash };
   } catch (e) {
     const s = await status(cwd);
-    if (s.conflicts) return { conflicts: true, count: s.conflicts, squash };
+    if (s.unmerged) return { conflicts: true, count: s.unmerged, squash };
     throw e;
   }
 }
@@ -734,7 +790,7 @@ async function revertCommit(cwd, sha) {
   try { await run(cwd, args); return { conflicts: false }; }
   catch (e) {
     const s = await status(cwd);
-    if (s.conflicts) return { conflicts: true, count: s.conflicts };
+    if (s.unmerged) return { conflicts: true, count: s.unmerged };
     throw e;
   }
 }
@@ -748,7 +804,7 @@ async function cherryPick(cwd, sha) {
   try { await run(cwd, args); return { conflicts: false }; }
   catch (e) {
     const s = await status(cwd);
-    if (s.conflicts) return { conflicts: true, count: s.conflicts };
+    if (s.unmerged) return { conflicts: true, count: s.unmerged };
     if (/empty|nothing to commit|allow-empty/i.test(e.stderr || '')) {
       await run(cwd, ['cherry-pick', '--abort']).catch(() => {});
       throw new GitError('Le modifiche di questo commit sono già presenti nel branch: non c\'è niente da applicare.');
@@ -873,7 +929,7 @@ async function rewriteCommits(cwd, fromSha, plan) {
     return { conflicts: false };
   } catch (e) {
     const s = await status(cwd);
-    if (s.state === 'rebasing') return { conflicts: true, count: s.conflicts };
+    if (s.state === 'rebasing') return { conflicts: true, count: s.unmerged };
     throw e;
   } finally {
     fs.rmSync(tmp, { force: true });
@@ -887,7 +943,7 @@ async function rebase(cwd, onto) {
   try { await run(cwd, ['rebase', onto], { env: NO_EDITOR }); return { conflicts: false }; }
   catch (e) {
     const s = await status(cwd);
-    if (s.state === 'rebasing') return { conflicts: true, count: s.conflicts };
+    if (s.state === 'rebasing') return { conflicts: true, count: s.unmerged };
     throw e;
   }
 }
@@ -895,14 +951,14 @@ async function rebase(cwd, onto) {
 async function rebaseContinue(cwd) {
   const s = await status(cwd);
   const changed = s.files.map((f) => f.path);
-  assertNoMarkers(cwd, changed);
+  assertNoMarkers(cwd, s.files.filter((f) => f.conflict).map((f) => f.path));
   if (changed.length) await run(cwd, ['add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: changed.join('\0') });
   try {
     await run(cwd, ['-c', 'core.editor=true', 'rebase', '--continue'], { env: NO_EDITOR });
     return { conflicts: false, done: (await repoState(cwd)) !== 'rebasing' };
   } catch (e) {
     const after = await status(cwd);
-    if (after.state === 'rebasing' && after.conflicts) return { conflicts: true, count: after.conflicts };
+    if (after.state === 'rebasing' && after.unmerged) return { conflicts: true, count: after.unmerged };
     if (after.state === 'rebasing' && /nothing to commit|No changes/i.test(e.stderr || '')) {
       await run(cwd, ['rebase', '--skip'], { env: NO_EDITOR });
       return rebaseContinue(cwd);
@@ -965,7 +1021,7 @@ module.exports = {
   parseStatus, status, fileDiff, commit, undoLastCommit, discard,
   log, unpushedShas, showCommit, commitFiles, commitFileDiff, branches, createBranch, checkout, deleteBranch, validateBranchName,
   fetch, pull, push, forcePush, clone,
-  pendingMessage, filesWithMarkers, renameBranch, deleteRemoteBranch,
+  pendingMessage, filesWithMarkers, resolveConflict, renameBranch, deleteRemoteBranch,
   stashAll, stashList, stashFiles, stashDetails, stashFileDiff, stashPop, stashDrop,
   compare, mergePreview, merge, abortMerge, rebase, rebaseContinue, rebaseAbort,
   commitsAfter, resetToCommit, checkoutCommit, revertCommit, cherryPick, tagsAt, createTag, pushTag,

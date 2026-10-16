@@ -396,7 +396,7 @@ function renderChanges({ keepMain = false } = {}) {
       shown.map((f) => fileRow(f))));
 
   // Box di commit
-  const onDefault = S.project && s.branch === S.project.defaultBranch && workflow() === 'mr';
+  const onDefault = !s.state && S.project && s.branch === S.project.defaultBranch && workflow() === 'mr';
   const blocked = pushBlocked();
   const summary = h('input', {
     type: 'text', placeholder: 'Titolo del commit (obbligatorio)', value: S.draft.summary, maxlength: 200,
@@ -408,7 +408,7 @@ function renderChanges({ keepMain = false } = {}) {
     oninput: (e) => { S.draft.description = e.target.value; },
     onkeydown: (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doCommit(commitBtn); },
   });
-  const canCommit = () => S.draft.summary.trim() && files.some((f) => !S.excluded.has(f.path));
+  const canCommit = () => (S.draft.summary.trim() || isCommitOp(s.state)) && files.some((f) => !S.excluded.has(f.path));
   const commitBtn = h('button', { class: 'btn primary block', disabled: !canCommit(), onclick: (e) => doCommit(e.currentTarget) },
     isCommitOp(s.state) ? `Completa il ${opLabel(s.state)}` : s.branch ? `Commit su ${s.branch}` : 'Commit');
 
@@ -575,8 +575,10 @@ function renderMultiSelection(files) {
 }
 
 function fileRow(f) {
-  const letter = { added: 'A', deleted: 'D', modified: 'M', renamed: 'R', conflict: '!' }[f.kind] || 'M';
-  const title = { added: 'Nuovo', deleted: 'Eliminato', modified: 'Modificato', renamed: 'Rinominato', conflict: 'In conflitto' }[f.kind];
+  const resolvedConflict = f.conflict && f.resolved;
+  const letter = resolvedConflict ? '✓' : ({ added: 'A', deleted: 'D', modified: 'M', renamed: 'R', conflict: '!' }[f.kind] || 'M');
+  const title = resolvedConflict ? 'Conflitto risolto: verrà incluso quando completi l\'operazione'
+    : { added: 'Nuovo', deleted: 'Eliminato', modified: 'Modificato', renamed: 'Rinominato', conflict: 'In conflitto' }[f.kind];
   const slash = f.path.lastIndexOf('/');
   const dir = slash >= 0 ? f.path.slice(0, slash + 1) : '';
   const base = f.path.slice(slash + 1);
@@ -606,17 +608,19 @@ function fileRow(f) {
     },
   }),
   h('span', { class: 'file-name' }, h('bdi', null, h('span', { class: 'file-dir' }, dir), base)),
-  h('span', { class: `kind ${f.kind}`, title }, letter));
+  h('span', { class: `kind ${resolvedConflict ? 'resolved' : f.kind}`, title }, letter));
 }
 
 async function renderFileDiff(file) {
   const main = $('main');
   const body = h('div', { class: 'main-scroll' }, h('div', { class: 'diff-message' }, 'Caricamento…'));
+  const conflictBar = file.conflict && conflictActions(file);
   mount(main,
     h('div', { class: 'main-head' },
       h('span', { class: 'title path' }, file.origPath ? `${file.origPath} → ${file.path}` : file.path),
       file.kind !== 'deleted' && editorButton([file.path]),
-      h('button', { class: 'btn small danger', onclick: () => discardFiles([file]) }, 'Scarta modifiche')),
+      !file.conflict && h('button', { class: 'btn small danger', onclick: () => discardFiles([file]) }, 'Scarta modifiche')),
+    conflictBar,
     body);
   try {
     const d = await api('git:diff', file);
@@ -629,7 +633,7 @@ function renderChangesOverview() {
   const s = S.status;
   const items = [];
   if (s.state) {
-    const conflicted = s.files.filter((f) => f.conflict);
+    const conflicted = s.files.filter((f) => f.conflict && !f.resolved);
     mount($('main'), h('div', { class: 'main-scroll' }, h('div', { class: 'empty' },
       h('h1', null, conflicted.length ? `${conflicted.length} file in conflitto` : 'Conflitti risolti'),
       h('p', null, conflicted.length
@@ -1633,12 +1637,12 @@ function inProgressBanner() {
     const op = opLabel(s.state);
     const Op = op.charAt(0).toUpperCase() + op.slice(1);
     return h('div', { class: 'banner warn', style: 'margin:10px' }, h('div', { class: 'text' },
-      h('strong', null, conflicts ? `${Op} in corso: ${conflicts} file in conflitto` : `${Op} in corso: conflitti risolti`),
+      h('strong', null, conflicts ? `${Op} in corso: ${conflicts} file in conflitto` : `${Op} in corso: tutti i conflitti sono risolti`),
       h('span', null, conflicts
         ? `Apri i file segnati con "!", scegli quale versione tenere, salva, poi clicca "Completa il ${op}".`
         : `Controlla le modifiche e clicca "Completa il ${op}" per creare il commit.`),
       h('div', { class: 'inline', style: 'margin-top:8px' },
-        conflicts > 0 && editorButton(s.files.filter((f) => f.conflict).map((f) => f.path)),
+        conflicts > 0 && editorButton(s.files.filter((f) => f.conflict && !f.resolved).map((f) => f.path)),
         h('button', { class: 'btn small danger', onclick: abortInProgress }, `Annulla ${op}`))));
   }
   return h('div', { class: 'banner warn', style: 'margin:10px' }, h('div', { class: 'text' },
@@ -2434,6 +2438,45 @@ function openMoveLocalCommits() {
     ],
     footer: [h('button', { class: 'btn', onclick: () => m.close() }, 'Annulla'), go],
   });
+}
+
+
+// =========================================================================== risoluzione dei conflitti
+
+// Nomi delle due versioni: durante un rebase "mia" e "loro" sono invertite rispetto al merge
+function conflictSides() {
+  const s = S.status;
+  if (s.state === 'rebasing') return { ours: 'la versione di destinazione', theirs: `la versione del tuo commit (${s.rebaseBranch || 'branch'})` };
+  return { ours: `la tua versione (${s.branch || 'HEAD'})`, theirs: 'la versione in arrivo' };
+}
+
+function conflictActions(file) {
+  const sides = conflictSides();
+  const deleted = /D/.test(file.conflictType || '');
+  const run = (how, label) => async (e) => {
+    if (how === 'resolved' && !file.resolved && !deleted) {
+      const ok = await confirmDialog({
+        title: 'Segnare il file come risolto?',
+        message: 'Nel file ci sono ancora righe che sembrano segni di conflitto (<<<<<<< o >>>>>>>). Se sono volute (per esempio fanno parte del contenuto) puoi segnarlo come risolto comunque.',
+        confirm: 'Segna come risolto',
+      });
+      if (!ok) return;
+    }
+    const done = await busy(e.currentTarget, async () => { await api('git:resolveConflict', { path: file.path, how }); return true; });
+    if (done) { toast(label, { type: 'success' }); await refreshStatus(); }
+  };
+  return h('div', { class: 'conflict-bar' + (file.resolved ? ' ok' : '') },
+    h('div', { class: 'text' },
+      h('strong', null, file.resolved ? 'Conflitto risolto' : deleted ? 'Il file è stato eliminato in una delle due versioni' : 'Questo file è in conflitto'),
+      h('span', null, file.resolved
+        ? 'Non ci sono più segni di conflitto: il file verrà incluso quando completi l\'operazione. Puoi anche segnarlo subito come risolto.'
+        : deleted
+          ? 'Scegli se tenere il file (con le modifiche) oppure eliminarlo.'
+          : 'Modificalo nell\'editor togliendo i segni <<<<<<< ======= >>>>>>> e salva, oppure scegli una delle due versioni intere.')),
+    h('div', { class: 'inline' },
+      h('button', { class: 'btn small', onclick: run('ours', 'Tenuta la tua versione del file.') }, `Tieni ${sides.ours}`),
+      h('button', { class: 'btn small', onclick: run('theirs', 'Tenuta la versione in arrivo del file.') }, `Tieni ${sides.theirs}`),
+      h('button', { class: 'btn small' + (file.resolved ? ' primary' : ''), onclick: run('resolved', 'File segnato come risolto.') }, 'Segna come risolto')));
 }
 
 init().catch((e) => toast(`Avvio non riuscito: ${e.message}`, { type: 'error', timeout: 0 }));

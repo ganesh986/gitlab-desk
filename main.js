@@ -363,6 +363,7 @@ handle('git:rebaseAbort', () => git.rebaseAbort(requireRepo()));
 handle('git:pendingMessage', () => git.pendingMessage(requireRepo()));
 handle('git:forcePush', () => git.forcePush(requireRepo(), gitAuth()));
 handle('git:markers', (rels) => git.filesWithMarkers(requireRepo(), rels));
+handle('git:resolveConflict', ({ path: rel, how }) => git.resolveConflict(requireRepo(), rel, how));
 handle('git:commitsAfter', (sha) => git.commitsAfter(requireRepo(), sha));
 handle('git:resetToCommit', (sha) => git.resetToCommit(requireRepo(), sha));
 handle('git:checkoutCommit', (sha) => git.checkoutCommit(requireRepo(), sha));

@@ -213,6 +213,73 @@ async function t(name, fn) {
     assert.strictEqual((await git.status(repo)).state, null);
     assert.ok(last);
   });
+  console.log('Conflitti risolti nell\'editor');
+  const makeConflict = async (branch, file, mine, theirs, eol = '\n') => {
+    await git.createBranch(repo, branch);
+    w(file, theirs.join(eol) + eol); await commitAll(`${branch} lato loro`);
+    await git.checkout(repo, 'main');
+    w(file, mine.join(eol) + eol); await commitAll(`${branch} lato mio`);
+    const r = await git.merge(repo, branch);
+    assert.ok(r.conflicts, 'deve esserci un conflitto');
+  };
+  await t('file con a capo Windows risolto nell\'editor: riconosciuto e completabile', async () => {
+    w('win.cs', 'base\r\n'); await commitAll('base win');
+    await makeConflict('feat/win', 'win.cs', ['mia riga'], ['loro riga'], '\r\n');
+    let s = await git.status(repo);
+    assert.strictEqual(s.unmerged, 1); assert.strictEqual(s.conflicts, 1);
+    w('win.cs', 'mia riga\r\nloro riga\r\n'); // come lo salverebbe un editor su Windows
+    s = await git.status(repo);
+    assert.strictEqual(s.unmerged, 1, 'Git lo considera ancora in conflitto finché non viene aggiunto');
+    assert.strictEqual(s.conflicts, 0, 'ma l\'app lo riconosce come risolto');
+    assert.ok(s.files.find((f) => f.path === 'win.cs').resolved);
+    await git.commit(repo, { paths: ['win.cs'], summary: '' }); // titolo vuoto: si usa quello proposto da Git
+    const [last] = await git.log(repo, { limit: 1 });
+    assert.match(last.subject, /Merge branch 'feat\/win'/);
+    assert.strictEqual((await git.status(repo)).state, null);
+  });
+  await t('segni di conflitto ancora presenti, anche in UTF-16', async () => {
+    fs.writeFileSync(path.join(repo, 'u16.txt'), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('a\r\n<<<<<<< HEAD\r\nx\r\n=======\r\ny\r\n>>>>>>> altro\r\n', 'utf16le')]));
+    fs.writeFileSync(path.join(repo, 'bom.txt'), '\uFEFF<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> altro\n');
+    fs.writeFileSync(path.join(repo, 'pulito.txt'), 'ciao\n======= non è un conflitto\n');
+    assert.deepStrictEqual(git.filesWithMarkers(repo, ['u16.txt', 'bom.txt', 'pulito.txt']), ['u16.txt', 'bom.txt']);
+    for (const f of ['u16.txt', 'bom.txt', 'pulito.txt']) fs.rmSync(path.join(repo, f));
+  });
+  await t('risoluzione rapida: mia versione, versione in arrivo, segna come risolto', async () => {
+    w('q1.txt', 'base\n'); w('q2.txt', 'base\n'); w('q3.txt', 'base\n'); await commitAll('base q');
+    await git.createBranch(repo, 'feat/q');
+    w('q1.txt', 'loro\n'); w('q2.txt', 'loro\n'); w('q3.txt', 'loro\n'); await commitAll('q loro');
+    await git.checkout(repo, 'main');
+    w('q1.txt', 'mio\n'); w('q2.txt', 'mio\n'); w('q3.txt', 'mio\n'); await commitAll('q mio');
+    assert.ok((await git.merge(repo, 'feat/q')).conflicts);
+    await git.resolveConflict(repo, 'q1.txt', 'ours');
+    await git.resolveConflict(repo, 'q2.txt', 'theirs');
+    // q3: il contenuto risolto contiene davvero righe simili ai segni (es. documentazione)
+    w('q3.txt', '<<<<<<< esempio nella documentazione\n>>>>>>> fine esempio\n');
+    let s = await git.status(repo);
+    assert.strictEqual(s.conflicts, 1, 'q3 sembra ancora in conflitto');
+    await git.resolveConflict(repo, 'q3.txt', 'resolved');
+    s = await git.status(repo);
+    assert.strictEqual(s.unmerged, 0);
+    await git.commit(repo, { paths: s.files.map((f) => f.path), summary: 'Merge q' });
+    assert.strictEqual(fs.readFileSync(path.join(repo, 'q1.txt'), 'utf8'), 'mio\n');
+    assert.strictEqual(fs.readFileSync(path.join(repo, 'q2.txt'), 'utf8'), 'loro\n');
+    assert.strictEqual((await git.status(repo)).state, null);
+  });
+  await t('conflitto modificato/eliminato: scelta della versione', async () => {
+    w('del.txt', 'base\n'); await commitAll('base del');
+    await git.createBranch(repo, 'feat/del');
+    await git.run(repo, ['rm', '-q', 'del.txt']); await git.commit(repo, { paths: ['del.txt'], summary: 'elimina del' });
+    await git.checkout(repo, 'main');
+    w('del.txt', 'modificato\n'); await commitAll('modifica del');
+    assert.ok((await git.merge(repo, 'feat/del')).conflicts);
+    const s = await git.status(repo);
+    const f = s.files.find((x) => x.path === 'del.txt');
+    assert.strictEqual(f.resolved, false, 'serve una scelta esplicita');
+    await git.resolveConflict(repo, 'del.txt', 'theirs'); // la loro versione: eliminato
+    assert.ok(!fs.existsSync(path.join(repo, 'del.txt')));
+    await git.commit(repo, { paths: [], summary: 'Merge del' });
+    assert.strictEqual((await git.status(repo)).state, null);
+  });
   await t('annulla merge', async () => {
     await git.createBranch(repo, 'feat/c');
     w('a.txt', 'C\n'); await commitAll('C');
