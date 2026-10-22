@@ -147,6 +147,80 @@ async function t(name, fn) {
   const w = (f, c) => fs.writeFileSync(path.join(repo, f), c);
   const commitAll = async (msg) => { const st = await git.status(repo); await git.commit(repo, { paths: st.files.flatMap((f) => (f.origPath ? [f.path, f.origPath] : [f.path])), summary: msg }); };
   await commitAll('Aggiunge .gitignore');
+  console.log('Indice preparato fuori dall\'app');
+  await t('il commit non svuota l\'indice e non scrive "reset: moving to HEAD"', async () => {
+    w('fuori-a.txt', 'a\n'); w('fuori-b.txt', 'b\n'); await commitAll('base fuori');
+    const reflogBefore = await git.run(repo, ['reflog', '--format=%gs']);
+    // preparato a mano da terminale: rimozione dall'indice di fuori-b.txt
+    await git.run(repo, ['rm', '-q', '--cached', 'fuori-b.txt']);
+    w('fuori-a.txt', 'a2\n');
+    await git.commit(repo, { paths: ['fuori-a.txt'], summary: 'solo fuori-a' });
+    const reflogAfter = await git.run(repo, ['reflog', '--format=%gs']);
+    const added = reflogAfter.split('\n').length - reflogBefore.split('\n').length;
+    assert.strictEqual(added, 1, 'una sola voce nuova nel reflog: il commit');
+    assert.ok(!/reset: moving to HEAD/.test(reflogAfter.split('\n')[0]));
+    const staged = await git.run(repo, ['diff', '--cached', '--name-status']);
+    assert.match(staged, /^D\tfuori-b\.txt$/m, 'la rimozione preparata a mano è ancora nell\'indice');
+    const [c] = await git.log(repo, { limit: 1 });
+    assert.deepStrictEqual((await git.commitFiles(repo, c.sha)).files.map((f) => f.path), ['fuori-a.txt'], 'nel commit solo il file scelto');
+    // la rimozione preparata a mano viene committata quando la si include
+    await git.commit(repo, { paths: ['fuori-b.txt'], summary: 'smette di tracciare fuori-b' });
+    assert.ok(fs.existsSync(path.join(repo, 'fuori-b.txt')));
+    assert.strictEqual((await git.run(repo, ['ls-files', 'fuori-b.txt'])).trim(), '');
+    fs.rmSync(path.join(repo, 'fuori-b.txt'));
+  });
+  await t('annulla ultimo commit senza toccare il resto dell\'indice', async () => {
+    w('u1.txt', '1\n'); w('u2.txt', '2\n'); await commitAll('base u');
+    await git.run(repo, ['rm', '-q', '--cached', 'u2.txt']);
+    w('u1.txt', 'uno\n'); await git.commit(repo, { paths: ['u1.txt'], summary: 'cambia u1' });
+    await git.undoLastCommit(repo);
+    const staged = await git.run(repo, ['diff', '--cached', '--name-status']);
+    assert.match(staged, /^D\tu2\.txt$/m, 'la rimozione di u2 resta preparata');
+    assert.ok(!/u1\.txt/.test(staged), 'u1 torna tra le modifiche non preparate');
+    assert.strictEqual(fs.readFileSync(path.join(repo, 'u1.txt'), 'utf8'), 'uno\n');
+    await git.run(repo, ['reset', '-q', '--', 'u2.txt']);
+    await git.discard(repo, (await git.status(repo)).files);
+  });
+
+  console.log('File tracciati finiti nel .gitignore');
+  await t('commit di un file tracciato dentro una cartella appena ignorata', async () => {
+    fs.mkdirSync(path.join(repo, 'Shared/obj/Debug'), { recursive: true });
+    w('Shared/obj/Debug/x.cache', 'a\n'); w('nuovo-file.txt', 'n\n');
+    await commitAll('Aggiunge obj');
+    fs.appendFileSync(path.join(repo, '.gitignore'), 'obj/\n');
+    w('Shared/obj/Debug/x.cache', 'b\n');
+    w('altro-nuovo.txt', 'z\n');
+    const s = await git.status(repo);
+    const cache = s.files.find((f) => f.path === 'Shared/obj/Debug/x.cache');
+    assert.ok(cache.ignoredButTracked, 'il file è segnalato come tracciato ma ignorato');
+    assert.strictEqual(s.ignoredTracked, 1);
+    assert.deepStrictEqual(await git.listIgnoredTracked(repo), ['Shared/obj/Debug/x.cache']);
+    await git.commit(repo, { paths: s.files.map((f) => f.path), summary: 'Aggiorna cache e gitignore' });
+    assert.strictEqual((await git.status(repo)).files.length, 0, 'tutto incluso nel commit');
+  });
+  await t('smetti di tracciare: esce dal repository ma resta sul disco', async () => {
+    w('Shared/obj/Debug/x.cache', 'c\n');
+    await git.untrackFiles(repo, ['Shared/obj/Debug/x.cache']);
+    let s = await git.status(repo);
+    const f = s.files.find((x) => x.path === 'Shared/obj/Debug/x.cache');
+    assert.ok(f && f.untracking, 'compare come file in uscita dal repository');
+    await git.commit(repo, { paths: ['Shared/obj/Debug/x.cache'], summary: 'Smette di tracciare obj' });
+    assert.ok(fs.existsSync(path.join(repo, 'Shared/obj/Debug/x.cache')), 'il file resta sul disco');
+    assert.strictEqual((await git.run(repo, ['ls-files', 'Shared/obj'])).trim(), '', 'non è più nel repository');
+    s = await git.status(repo);
+    assert.strictEqual(s.files.length, 0, 'ignorato: non compare più tra le modifiche');
+  });
+  await t('annullare "smetti di tracciare" non tocca il file sul disco', async () => {
+    w('tieni.txt', 'versione committata\n'); await commitAll('tieni');
+    w('tieni.txt', 'modifica locale\n');
+    await git.untrackFiles(repo, ['tieni.txt']);
+    const s = await git.status(repo);
+    await git.discard(repo, s.files.filter((f) => f.path === 'tieni.txt'));
+    assert.strictEqual(fs.readFileSync(path.join(repo, 'tieni.txt'), 'utf8'), 'modifica locale\n');
+    assert.ok((await git.run(repo, ['ls-files', 'tieni.txt'])).includes('tieni.txt'), 'di nuovo tracciato');
+    await git.discard(repo, (await git.status(repo)).files);
+  });
+
   await t('confronto e anteprima merge senza conflitti', async () => {
     await git.createBranch(repo, 'feat/a');
     w('a.txt', 'uno\n'); await commitAll('A1');

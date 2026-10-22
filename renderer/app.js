@@ -527,6 +527,7 @@ async function openFileMenu() {
   if (!r) return;
   switch (r.action) {
     case 'discard': discardFiles(files); break;
+    case 'untrack': untrackPaths(files.filter((f) => !f.untracked && !f.untracking && f.kind !== 'deleted').map((f) => f.path)); break;
     case 'include': setIncluded(files, true); break;
     case 'exclude': setIncluded(files, false); break;
     case 'copied': toast('Copiato negli appunti.'); break;
@@ -576,8 +577,9 @@ function renderMultiSelection(files) {
 
 function fileRow(f) {
   const resolvedConflict = f.conflict && f.resolved;
-  const letter = resolvedConflict ? '✓' : ({ added: 'A', deleted: 'D', modified: 'M', renamed: 'R', conflict: '!' }[f.kind] || 'M');
-  const title = resolvedConflict ? 'Conflitto risolto: verrà incluso quando completi l\'operazione'
+  const letter = f.untracking ? '−' : resolvedConflict ? '✓' : ({ added: 'A', deleted: 'D', modified: 'M', renamed: 'R', conflict: '!' }[f.kind] || 'M');
+  const title = f.untracking ? 'Esce dal repository con il prossimo commit, ma resta sul disco'
+    : resolvedConflict ? 'Conflitto risolto: verrà incluso quando completi l\'operazione'
     : { added: 'Nuovo', deleted: 'Eliminato', modified: 'Modificato', renamed: 'Rinominato', conflict: 'In conflitto' }[f.kind];
   const slash = f.path.lastIndexOf('/');
   const dir = slash >= 0 ? f.path.slice(0, slash + 1) : '';
@@ -608,13 +610,14 @@ function fileRow(f) {
     },
   }),
   h('span', { class: 'file-name' }, h('bdi', null, h('span', { class: 'file-dir' }, dir), base)),
-  h('span', { class: `kind ${resolvedConflict ? 'resolved' : f.kind}`, title }, letter));
+  f.ignoredButTracked && h('span', { class: 'chip-ignored', title: 'Il file è nel .gitignore ma è ancora nel repository: Git continua a seguirlo' }, '.gitignore'),
+  h('span', { class: `kind ${f.untracking ? 'untracking' : resolvedConflict ? 'resolved' : f.kind}`, title }, letter));
 }
 
 async function renderFileDiff(file) {
   const main = $('main');
   const body = h('div', { class: 'main-scroll' }, h('div', { class: 'diff-message' }, 'Caricamento…'));
-  const conflictBar = file.conflict && conflictActions(file);
+  const conflictBar = file.conflict ? conflictActions(file) : (file.untracking || file.ignoredButTracked) ? trackingBar(file) : null;
   mount(main,
     h('div', { class: 'main-head' },
       h('span', { class: 'title path' }, file.origPath ? `${file.origPath} → ${file.path}` : file.path),
@@ -698,6 +701,7 @@ function renderChangesOverview() {
   }
   const stash = !s.files.length && currentStash();
   if (stash) banners.unshift(stashCard(stash));
+  if (s.ignoredTracked > 0) banners.push(ignoredTrackedBanner(s.ignoredTracked));
   mount($('main'), h('div', { class: 'main-scroll' }, banners, items));
 }
 
@@ -2477,6 +2481,55 @@ function conflictActions(file) {
       h('button', { class: 'btn small', onclick: run('ours', 'Tenuta la tua versione del file.') }, `Tieni ${sides.ours}`),
       h('button', { class: 'btn small', onclick: run('theirs', 'Tenuta la versione in arrivo del file.') }, `Tieni ${sides.theirs}`),
       h('button', { class: 'btn small' + (file.resolved ? ' primary' : ''), onclick: run('resolved', 'File segnato come risolto.') }, 'Segna come risolto')));
+}
+
+
+// =========================================================================== file tracciati ma nel .gitignore
+
+async function untrackPaths(paths) {
+  if (!paths.length) return;
+  const ok = await confirmDialog({
+    title: paths.length === 1 ? 'Smettere di tracciare il file?' : `Smettere di tracciare ${paths.length} file?`,
+    message: `${paths.length === 1 ? 'Il file uscirà' : 'I file usciranno'} dal repository con il prossimo commit, ma ${paths.length === 1 ? 'resterà' : 'resteranno'} sul tuo disco. Per evitare che ${paths.length === 1 ? 'venga aggiunto' : 'vengano aggiunti'} di nuovo, assicurati che ${paths.length === 1 ? 'sia' : 'siano'} nel .gitignore. Ai colleghi, dopo il pull, il file verrà eliminato dalla loro copia.`,
+    confirm: 'Smetti di tracciare',
+  });
+  if (!ok) return;
+  const done = await busy(null, async () => { await api('git:untrack', paths); return true; });
+  if (done) { toast('Fatto: fai commit per completare la rimozione dal repository.', { type: 'success', timeout: 6000 }); await refreshStatus(); }
+}
+
+async function untrackAllIgnored(btn) {
+  const n = S.status.ignoredTracked;
+  const ok = await confirmDialog({
+    title: `Smettere di tracciare ${n} file?`,
+    message: `Sono i file già nel repository che il .gitignore esclude (per esempio cartelle obj o bin). Usciranno dal repository con il prossimo commit ma resteranno sul tuo disco. Ai colleghi, dopo il pull, verranno eliminati dalla loro copia: di solito per questi file va bene, perché vengono rigenerati dalla compilazione.`,
+    confirm: 'Smetti di tracciarli',
+  });
+  if (!ok) return;
+  const count = await busy(btn, () => api('git:untrackAllIgnored'));
+  if (count) { toast(`${count} file pronti a uscire dal repository: fai commit per completare.`, { type: 'success', timeout: 7000 }); await refreshStatus(); }
+}
+
+function ignoredTrackedBanner(n) {
+  return banner('', `${n === 1 ? 'Un file è' : `${n} file sono`} nel .gitignore ma ancora nel repository`,
+    'Il .gitignore vale solo per i file nuovi: quelli già nel repository continuano a essere seguiti da Git (succede spesso con le cartelle obj e bin).',
+    h('button', { class: 'btn', onclick: (e) => untrackAllIgnored(e.currentTarget) }, n === 1 ? 'Smetti di tracciarlo' : 'Smetti di tracciarli'));
+}
+
+function trackingBar(file) {
+  if (file.untracking) {
+    return h('div', { class: 'conflict-bar ok' },
+      h('div', { class: 'text' }, h('strong', null, 'Il file uscirà dal repository'),
+        h('span', null, 'Con il prossimo commit non sarà più nel repository, ma resterà sul tuo disco.')),
+      h('div', { class: 'inline' }, h('button', { class: 'btn small', onclick: () => discardFiles([file]) }, 'Continua a tracciarlo')));
+  }
+  const n = S.status.ignoredTracked || 0;
+  return h('div', { class: 'conflict-bar' },
+    h('div', { class: 'text' }, h('strong', null, 'Questo file è nel .gitignore ma è ancora nel repository'),
+      h('span', null, 'Per questo Git continua a seguirne le modifiche. Puoi includerlo nel commit come al solito, oppure toglierlo dal repository lasciandolo sul disco.')),
+    h('div', { class: 'inline' },
+      h('button', { class: 'btn small', onclick: () => untrackPaths([file.path]) }, 'Smetti di tracciarlo'),
+      n > 1 && h('button', { class: 'btn small', onclick: (e) => untrackAllIgnored(e.currentTarget) }, `Tutti i ${n} file ignorati`)));
 }
 
 init().catch((e) => toast(`Avvio non riuscito: ${e.message}`, { type: 'error', timeout: 0 }));

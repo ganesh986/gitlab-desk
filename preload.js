@@ -16,7 +16,7 @@ const channels = [
   'git:commitFiles', 'git:commitFileDiff', 'clipboard:write',
   'git:commitsAfter', 'git:resetToCommit', 'git:checkoutCommit', 'git:revertCommit', 'git:cherryPick', 'git:createTag',
   'git:reorderCandidates', 'git:dropCommit', 'git:moveLocalCommits', 'git:rewriteCommits', 'history:contextMenu',
-  'git:pendingMessage', 'git:forcePush', 'git:markers', 'git:resolveConflict',
+  'git:pendingMessage', 'git:forcePush', 'git:markers', 'git:resolveConflict', 'git:untrack', 'git:untrackAllIgnored',
   'shell:open', 'dialog:pickFile', 'files:contextMenu', 'files:openInEditor',
 ];
 

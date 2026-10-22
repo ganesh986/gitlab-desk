@@ -363,6 +363,8 @@ handle('git:rebaseAbort', () => git.rebaseAbort(requireRepo()));
 handle('git:pendingMessage', () => git.pendingMessage(requireRepo()));
 handle('git:forcePush', () => git.forcePush(requireRepo(), gitAuth()));
 handle('git:markers', (rels) => git.filesWithMarkers(requireRepo(), rels));
+handle('git:untrack', (paths) => git.untrackFiles(requireRepo(), paths));
+handle('git:untrackAllIgnored', async () => { const list = await git.listIgnoredTracked(requireRepo()); await git.untrackFiles(requireRepo(), list); return list.length; });
 handle('git:resolveConflict', ({ path: rel, how }) => git.resolveConflict(requireRepo(), rel, how));
 handle('git:commitsAfter', (sha) => git.commitsAfter(requireRepo(), sha));
 handle('git:resetToCommit', (sha) => git.resetToCommit(requireRepo(), sha));
@@ -466,6 +468,11 @@ handle('files:contextMenu', ({ files, canInclude, canExclude }) => new Promise((
       label: `Ignora tutti i file .${ext} (aggiungi a .gitignore)`,
       click: run(() => ignoreFiles([gitignore.patternForExtension(ext)], files.filter((f) => gitignore.extensionOf(f.path) === ext))),
     })),
+    {
+      label: one ? 'Smetti di tracciare (resta sul disco)' : 'Smetti di tracciare i file selezionati (restano sul disco)',
+      enabled: files.some((f) => !f.untracked && !f.untracking && f.kind !== 'deleted'),
+      click: () => done({ action: 'untrack' }),
+    },
     { type: 'separator' },
     { label: one ? 'Includi nel commit' : 'Includi i file selezionati', enabled: canInclude, click: () => done({ action: 'include' }) },
     { label: one ? 'Escludi dal commit' : 'Escludi i file selezionati', enabled: canExclude, click: () => done({ action: 'exclude' }) },

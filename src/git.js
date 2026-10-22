@@ -207,6 +207,18 @@ async function status(cwd) {
   }
   s.unmerged = unmerged.length;
   s.conflicts = unmerged.filter((f) => !f.resolved).length;
+  const untracking = new Set(untrackingPaths(cwd, s.files));
+  for (const f of s.files) if (untracking.has(f.path) && !f.untracked) f.untracking = true;
+  // un file tolto dal repository ma non ignorato comparirebbe due volte (eliminato + nuovo): ne tengo una
+  s.files = s.files.filter((f) => !(f.untracked && untracking.has(f.path)));
+  const trackedPaths = s.files.filter((f) => !f.untracked && !f.untracking && f.kind !== 'deleted').map((f) => f.path);
+  if (trackedPaths.length) {
+    const ign = await run(cwd, ['check-ignore', '--no-index', '-z', '--stdin'], { input: trackedPaths.join('\0'), okCodes: [1] }).catch(() => '');
+    const ignored = new Set(ign.split('\0').filter(Boolean));
+    for (const f of s.files) if (ignored.has(f.path)) f.ignoredButTracked = true;
+  }
+  // tutti i file nel repository che il .gitignore escluderebbe (anche quelli non modificati)
+  s.ignoredTracked = (await listIgnoredTracked(cwd)).length;
   if (s.state === 'rebasing') s.rebaseBranch = await rebaseHeadName(cwd);
   s.rebased = s.upstream && s.ahead && s.behind ? await looksRebased(cwd, s.upstream) : false;
   return s;
@@ -322,13 +334,13 @@ async function resolveConflict(cwd, rel, how) {
     const wanted = how === 'ours' ? '2' : '3';
     if (stages.includes(wanted)) {
       await run(cwd, ['checkout', `--${how}`, '--', rel]);
-      await run(cwd, ['add', '--', rel]);
+      await run(cwd, ['add', '-u', '--', rel]);
     } else {
       // in quella versione il file non esiste più: sceglierla vuol dire eliminarlo
       await run(cwd, ['rm', '-q', '--', rel]);
     }
   } else if (how === 'resolved') {
-    if (fs.existsSync(abs)) await run(cwd, ['add', '--', rel]);
+    if (fs.existsSync(abs)) await run(cwd, ['add', '-u', '--', rel]);
     else await run(cwd, ['rm', '-q', '--cached', '--', rel]);
   } else {
     throw new GitError('Scelta non valida.');
@@ -372,6 +384,42 @@ function untrackedDiff(cwd, rel) {
 }
 
 // ---------------------------------------------------------------------------
+// Aggiunge all'indice i file indicati.
+// I file già tracciati passano da "git add -u", che non si blocca se il percorso è
+// finito nel .gitignore; i file nuovi da "git add" normale (se Git li mostra, non sono ignorati).
+async function stagePaths(cwd, paths, { removeCached = [] } = {}) {
+  const want = new Set(paths);
+  const st = parseStatus(await run(cwd, ['status', '--porcelain=v2', '-z', '--untracked-files=all']));
+  const tracked = [];
+  const untracked = [];
+  for (const f of st.files) {
+    if (!want.has(f.path) || removeCached.includes(f.path)) continue;
+    (f.untracked ? untracked : tracked).push(f.path);
+  }
+  const nul = (list) => ({ input: list.join('\0') });
+  if (tracked.length) await run(cwd, ['add', '-u', '--pathspec-from-file=-', '--pathspec-file-nul'], nul(tracked));
+  if (untracked.length) await run(cwd, ['add', '--pathspec-from-file=-', '--pathspec-file-nul'], nul(untracked));
+  if (removeCached.length) await run(cwd, ['rm', '--cached', '-q', '--ignore-unmatch', '--pathspec-from-file=-', '--pathspec-file-nul'], nul(removeCached));
+}
+
+// File che l'utente ha deciso di non tracciare più (tolti dall'indice, ancora presenti sul disco)
+function untrackingPaths(cwd, statusFiles) {
+  return statusFiles
+    .filter((f) => !f.untracked && !f.conflict && f.kind === 'deleted' && f.staged && fs.existsSync(path.join(cwd, f.path)))
+    .map((f) => f.path);
+}
+
+async function listIgnoredTracked(cwd) {
+  const out = await run(cwd, ['ls-files', '-ci', '--exclude-standard', '-z']).catch(() => '');
+  return out.split('\0').filter(Boolean);
+}
+
+/** Smette di tracciare dei file: escono dal repository al prossimo commit ma restano sul disco. */
+async function untrackFiles(cwd, paths) {
+  if (!paths.length) return;
+  await run(cwd, ['rm', '--cached', '-q', '-r', '--ignore-unmatch', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: paths.join('\0') });
+}
+
 // Commit: include solo i file selezionati (modello "spunta per includere")
 
 async function commit(cwd, { paths, summary, description, amend = false }) {
@@ -380,17 +428,69 @@ async function commit(cwd, { paths, summary, description, amend = false }) {
   if (['merging', 'reverting', 'cherry-picking'].includes(state)) return commitMerge(cwd, { paths: paths || [], summary, description });
   if (!summary || !summary.trim()) throw new GitError('Scrivi un titolo per il commit.');
   if (!amend && (!paths || !paths.length)) throw new GitError('Seleziona almeno un file da includere nel commit.');
-  if (paths && paths.length) assertNoMarkers(cwd, paths);
-  const head = await hasHead(cwd);
-  if (head) await run(cwd, ['reset', '-q']); // svuota l'indice (le modifiche restano nei file)
-  if (paths && paths.length) {
-    await run(cwd, ['add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: paths.join('\0') });
-  }
+  paths = paths || [];
+  if (paths.length) assertNoMarkers(cwd, paths);
   const message = description && description.trim() ? `${summary.trim()}\n\n${description.trim()}\n` : `${summary.trim()}\n`;
-  const args = ['commit', '-F', '-'];
-  if (amend) args.push('--amend');
-  await run(cwd, args, { input: message });
+  return commitWithTempIndex(cwd, paths, message, { amend });
+}
+
+// Il commit viene costruito in un indice temporaneo, partendo dall'ultimo commit e aggiungendo
+// solo i file scelti. L'indice vero del repository non viene svuotato: ciò che è stato preparato
+// fuori dall'app (git add, git rm --cached, ...) per gli altri file resta com'è.
+// È lo stesso meccanismo che Git usa per "git commit -- <file>".
+async function commitWithTempIndex(cwd, paths, message, { amend = false } = {}) {
+  const want = new Set(paths);
+  const before = parseStatus(await run(cwd, ['status', '--porcelain=v2', '-z', '--untracked-files=all']));
+  const untracking = new Set(untrackingPaths(cwd, before.files));
+  const addU = [];
+  const addPlain = [];
+  const addForce = [];
+  const rmCached = [];
+  const touched = new Set(paths);
+  for (const f of before.files) {
+    if (!want.has(f.path)) continue;
+    if (f.untracked) { if (!untracking.has(f.path)) addPlain.push(f.path); continue; }
+    if (untracking.has(f.path)) { rmCached.push(f.path); continue; }
+    if (f.kind === 'renamed' && f.origPath) { addForce.push(f.path); addU.push(f.origPath); touched.add(f.origPath); continue; }
+    if (f.kind === 'added' && f.staged) { addForce.push(f.path); continue; } // aggiunto a mano, anche se ignorato
+    addU.push(f.path);
+  }
+  const head = await hasHead(cwd);
+  const tmp = path.join(await gitDir(cwd), `gitlab-desk-index-${process.pid}-${Date.now()}`);
+  const env = { GIT_INDEX_FILE: tmp };
+  const nul = (list) => ({ env, input: list.join('\0') });
+  const spec = ['--pathspec-from-file=-', '--pathspec-file-nul'];
+  try {
+    await run(cwd, head ? ['read-tree', 'HEAD'] : ['read-tree', '--empty'], { env });
+    if (addU.length) await run(cwd, ['add', '-u', ...spec], nul(addU));
+    if (addPlain.length) await run(cwd, ['add', ...spec], nul(addPlain));
+    if (addForce.length) await run(cwd, ['add', '-f', ...spec], nul(addForce));
+    if (rmCached.length) await run(cwd, ['rm', '--cached', '-q', '--ignore-unmatch', ...spec], nul(rmCached));
+    const args = ['commit', '-F', '-'];
+    if (amend) args.push('--amend');
+    await run(cwd, args, { env, input: message });
+  } finally {
+    fs.rmSync(tmp, { force: true });
+    fs.rmSync(`${tmp}.lock`, { force: true });
+  }
+  // l'indice vero viene allineato al nuovo commit solo per i file appena committati
+  await unstagePaths(cwd, [...touched]);
   return (await run(cwd, ['rev-parse', '--short', 'HEAD'])).trim();
+}
+
+// Riporta all'ultimo commit solo le voci dell'indice indicate (non sposta HEAD, non scrive nel reflog)
+async function unstagePaths(cwd, list) {
+  const paths = list.filter(Boolean);
+  if (!paths.length || !(await hasHead(cwd))) return;
+  await run(cwd, ['reset', '-q', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: paths.join('\0') });
+}
+
+// Sposta il branch a un commit precedente lasciando le modifiche nei file, senza toccare
+// le voci dell'indice che non riguardano i commit tolti
+async function softResetTo(cwd, target) {
+  const changed = (await run(cwd, ['diff', '--name-only', '-z', '--no-renames', target, 'HEAD'])).split('\0').filter(Boolean);
+  await run(cwd, ['reset', '--soft', '-q', target]);
+  await unstagePaths(cwd, changed);
 }
 
 // Commit che conclude un merge: l'indice non va svuotato, altrimenti Git dimentica il merge
@@ -404,7 +504,7 @@ async function commitMerge(cwd, { paths, summary, description }) {
   // i segni di conflitto si controllano solo sui file ancora in conflitto: quelli segnati
   // come risolti dall'utente vengono accettati così come sono
   assertNoMarkers(cwd, conflicted);
-  if (paths.length) await run(cwd, ['add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: paths.join('\0') });
+  if (paths.length) await stagePaths(cwd, paths, { removeCached: untrackingPaths(cwd, s.files).filter((p) => paths.includes(p)) });
   let title = (summary || '').trim();
   let body = (description || '').trim();
   if (!title) {
@@ -421,11 +521,16 @@ async function commitMerge(cwd, { paths, summary, description }) {
 async function undoLastCommit(cwd) {
   const parents = (await run(cwd, ['rev-list', '--parents', '-n', '1', 'HEAD'])).trim().split(' ');
   if (parents.length < 2) throw new GitError('Il primo commit del repository non può essere annullato da qui.');
-  await run(cwd, ['reset', '--soft', 'HEAD~1']);
-  await run(cwd, ['reset', '-q']);
+  await softResetTo(cwd, parents[1]);
 }
 
 async function discard(cwd, files) {
+  const untracking = files.filter((f) => f.untracking).map((f) => f.path);
+  files = files.filter((f) => !(f.untracked && untracking.includes(f.path)));
+  if (untracking.length) {
+    await run(cwd, ['restore', '--staged', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: untracking.join('\0') });
+    files = files.filter((f) => !f.untracking);
+  }
   const tracked = files.filter((f) => !f.untracked).flatMap((f) => (f.origPath ? [f.path, f.origPath] : [f.path]));
   const untracked = files.filter((f) => f.untracked).map((f) => f.path);
   if (tracked.length && (await hasHead(cwd))) {
@@ -772,7 +877,7 @@ async function resetToCommit(cwd, sha) {
   if (after.pushed) throw new GitError(`${after.pushed} dei commit successivi sono già sul server: non si possono togliere con un reset. Usa "Annulla le modifiche del commit" (revert).`);
   const s = await status(cwd);
   if (s.state) throw new GitError(`C'è un ${STATE_LABEL[s.state]} in corso: completalo o annullalo prima.`);
-  await run(cwd, ['reset', '--mixed', '-q', sha]);
+  await softResetTo(cwd, sha);
   return after.count;
 }
 
@@ -838,7 +943,7 @@ async function dropCommit(cwd, sha, { keepChanges = true } = {}) {
   if (!parent) throw new GitError('È il primo commit del repository: non si può rimuovere.');
   if (after.count === 0) {
     // ultimo commit del branch
-    if (keepChanges) await run(cwd, ['reset', '--mixed', '-q', parent]);
+    if (keepChanges) await softResetTo(cwd, parent);
     else await run(cwd, ['reset', '--keep', '-q', parent]);
     return { conflicts: false, wasLast: true };
   }
@@ -952,7 +1057,7 @@ async function rebaseContinue(cwd) {
   const s = await status(cwd);
   const changed = s.files.map((f) => f.path);
   assertNoMarkers(cwd, s.files.filter((f) => f.conflict).map((f) => f.path));
-  if (changed.length) await run(cwd, ['add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: changed.join('\0') });
+  if (changed.length) await stagePaths(cwd, changed, { removeCached: untrackingPaths(cwd, s.files) });
   try {
     await run(cwd, ['-c', 'core.editor=true', 'rebase', '--continue'], { env: NO_EDITOR });
     return { conflicts: false, done: (await repoState(cwd)) !== 'rebasing' };
@@ -1021,7 +1126,7 @@ module.exports = {
   parseStatus, status, fileDiff, commit, undoLastCommit, discard,
   log, unpushedShas, showCommit, commitFiles, commitFileDiff, branches, createBranch, checkout, deleteBranch, validateBranchName,
   fetch, pull, push, forcePush, clone,
-  pendingMessage, filesWithMarkers, resolveConflict, renameBranch, deleteRemoteBranch,
+  pendingMessage, filesWithMarkers, resolveConflict, untrackFiles, stagePaths, listIgnoredTracked, renameBranch, deleteRemoteBranch,
   stashAll, stashList, stashFiles, stashDetails, stashFileDiff, stashPop, stashDrop,
   compare, mergePreview, merge, abortMerge, rebase, rebaseContinue, rebaseAbort,
   commitsAfter, resetToCommit, checkoutCommit, revertCommit, cherryPick, tagsAt, createTag, pushTag,
