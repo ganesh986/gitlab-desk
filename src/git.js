@@ -860,13 +860,28 @@ async function isMergeCommit(cwd, sha) {
 }
 
 // Commit successivi a sha sul branch attuale, e quanti di questi sono già sul server
+// "Pubblicato" vuol dire: presente nel branch del server a cui è collegato il branch attuale
+// (lo stesso criterio dell'etichetta "da pubblicare"). Se il branch non è mai stato pubblicato
+// si confronta, per prudenza, con tutti i branch del server.
+async function publishedRef(cwd) {
+  const s = await status(cwd);
+  return s.upstream ? [s.upstream] : ['--remotes=origin'];
+}
+
 async function commitsAfter(cwd, sha) {
   checkSha(sha);
   const isAncestor = await run(cwd, ['merge-base', '--is-ancestor', sha, 'HEAD']).then(() => true, () => false);
   if (!isAncestor) return null;
   const all = (await run(cwd, ['rev-list', `${sha}..HEAD`])).split('\n').filter(Boolean);
-  const local = (await run(cwd, ['rev-list', `${sha}..HEAD`, '--not', '--remotes=origin'])).split('\n').filter(Boolean);
+  const local = (await run(cwd, ['rev-list', `${sha}..HEAD`, '--not', ...(await publishedRef(cwd))])).split('\n').filter(Boolean);
   return { count: all.length, pushed: all.length - local.length };
+}
+
+// Branch del server che contengono un commit (escluso origin/HEAD)
+async function remoteBranchesContaining(cwd, sha) {
+  checkSha(sha);
+  const out = await run(cwd, ['branch', '-r', '--contains', sha, '--format=%(refname:short)']).catch(() => '');
+  return out.split('\n').map((x) => x.trim()).filter((x) => x && !/\/HEAD$/.test(x) && x !== 'origin');
 }
 
 // Riporta il branch a un commit: i commit successivi spariscono, le loro modifiche restano nei file
@@ -921,7 +936,7 @@ async function cherryPick(cwd, sha) {
 // Un commit è "solo locale" se nessun branch del server lo contiene
 async function isLocalOnly(cwd, sha) {
   checkSha(sha);
-  const out = await run(cwd, ['rev-list', '-n', '1', sha, '--not', '--remotes=origin']);
+  const out = await run(cwd, ['rev-list', '-n', '1', sha, '--not', ...(await publishedRef(cwd))]);
   return out.trim().length > 0;
 }
 
@@ -935,7 +950,12 @@ async function dropCommit(cwd, sha, { keepChanges = true } = {}) {
   const s = await status(cwd);
   if (!s.branch) throw new GitError('Non sei su un branch.');
   if (s.state) throw new GitError(`C'è un ${STATE_LABEL[s.state]} in corso: completalo o annullalo prima.`);
-  if (!(await isLocalOnly(cwd, sha))) throw new GitError('Questo commit è già sul server: non si può rimuovere senza riscrivere la cronologia condivisa. Usa "Annulla le modifiche del commit (revert)".');
+  if (!(await isLocalOnly(cwd, sha))) {
+    const where = s.upstream ? `nel branch ${s.upstream} sul server` : 'sul server';
+    throw new GitError(`Questo commit è già ${where}: non si può rimuovere senza riscrivere la cronologia condivisa. Usa "Annulla le modifiche del commit (revert)".`);
+  }
+  // il commit può comparire in altri branch del server (o in riferimenti vecchi): da lì non viene tolto
+  const alsoOn = (await remoteBranchesContaining(cwd, sha)).filter((b) => b !== s.upstream);
   const after = await commitsAfter(cwd, sha);
   if (!after) throw new GitError('Il commit non fa parte del branch attuale.');
   const { parent, isMerge } = await parentOf(cwd, sha);
@@ -945,10 +965,11 @@ async function dropCommit(cwd, sha, { keepChanges = true } = {}) {
     // ultimo commit del branch
     if (keepChanges) await softResetTo(cwd, parent);
     else await run(cwd, ['reset', '--keep', '-q', parent]);
-    return { conflicts: false, wasLast: true };
+    return { conflicts: false, wasLast: true, alsoOn };
   }
   const { commits } = await reorderCandidates(cwd, sha);
-  return rewriteCommits(cwd, sha, commits.map((c) => ({ sha: c.sha, action: c.sha === sha ? 'drop' : 'pick' })));
+  const r = await rewriteCommits(cwd, sha, commits.map((c) => ({ sha: c.sha, action: c.sha === sha ? 'drop' : 'pick' })));
+  return { ...r, alsoOn };
 }
 
 /**
@@ -1000,7 +1021,7 @@ async function reorderCandidates(cwd, sha) {
   const commits = await log(cwd, { limit: 51, range: `${sha}~1..HEAD` }).catch(async () => log(cwd, { limit: 51, range: 'HEAD' }));
   if (commits.length > 50) throw new GitError('Si possono riordinare al massimo 50 commit alla volta: scegli un commit più recente.');
   if (commits.some((c) => c.isMerge)) throw new GitError('Tra questi commit c\'è un commit di merge: il riordino funziona solo su una cronologia lineare.');
-  const local = new Set((await run(cwd, ['rev-list', 'HEAD', '--not', '--remotes=origin'])).split('\n').filter(Boolean));
+  const local = new Set((await run(cwd, ['rev-list', 'HEAD', '--not', ...(await publishedRef(cwd))])).split('\n').filter(Boolean));
   return { commits: commits.reverse().map((c) => ({ ...c, pushed: !local.has(c.sha) })) }; // dal più vecchio al più recente
 }
 
@@ -1130,5 +1151,5 @@ module.exports = {
   stashAll, stashList, stashFiles, stashDetails, stashFileDiff, stashPop, stashDrop,
   compare, mergePreview, merge, abortMerge, rebase, rebaseContinue, rebaseAbort,
   commitsAfter, resetToCommit, checkoutCommit, revertCommit, cherryPick, tagsAt, createTag, pushTag,
-  reorderCandidates, rewriteCommits, STATE_LABEL, isLocalOnly, dropCommit, moveLocalCommits,
+  reorderCandidates, rewriteCommits, STATE_LABEL, isLocalOnly, dropCommit, moveLocalCommits, remoteBranchesContaining,
 };

@@ -2393,7 +2393,10 @@ async function dropLocalCommit(c) {
   await refreshStatus();
   afterHistoryChange();
   if (r.conflicts) { switchTab('changes'); toast(`Conflitti in ${r.count} file: risolvili e clicca "Continua rebase".`, { type: 'error', timeout: 0 }); return; }
-  toast(isLast && keep ? 'Commit rimosso: le sue modifiche sono nel pannello Modifiche.' : 'Commit rimosso.', { type: 'success', timeout: 6000 });
+  const also = (r.alsoOn || []).length
+    ? `\n\nNota: lo stesso commit è ancora in ${r.alsoOn.join(', ')}. Da lì non viene tolto; se quel branch non esiste più sul server, un Fetch aggiorna l'elenco.`
+    : '';
+  toast((isLast && keep ? 'Commit rimosso: le sue modifiche sono nel pannello Modifiche.' : 'Commit rimosso.') + also, { type: 'success', timeout: also ? 12000 : 6000 });
 }
 
 function openMoveLocalCommits() {

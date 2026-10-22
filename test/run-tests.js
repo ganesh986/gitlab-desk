@@ -588,7 +588,7 @@ async function t(name, fn) {
     await git.push(repo, null);
     const [c] = await git.log(repo, { limit: 1 });
     assert.ok(!(await git.isLocalOnly(repo, c.sha)));
-    await assert.rejects(git.dropCommit(repo, c.sha), /già sul server/);
+    await assert.rejects(git.dropCommit(repo, c.sha), /già nel branch origin\/main sul server/);
   });
   await t('sposta i commit locali su un nuovo branch', async () => {
     const st0 = await git.status(repo);
@@ -607,6 +607,23 @@ async function t(name, fn) {
     await assert.rejects(git.moveLocalCommits(repo, 'altro'), /mai stato pubblicato/);
     await git.discard(repo, s.files);
     await git.checkout(repo, r.from);
+  });
+  await t('commit non su origin/master ma presente in un altro riferimento remoto: si può rimuovere', async () => {
+    await git.checkout(repo, 'main');
+    await git.push(repo, null);
+    w('pw1.txt', 'password vecchia\n'); await commitAll('ultime password');
+    const [c] = await git.log(repo, { limit: 1 });
+    // lo stesso commit finisce su un altro branch del server (o resta in un riferimento vecchio)
+    await git.run(repo, ['push', '-q', 'origin', `${c.sha}:refs/heads/vecchio-branch`]);
+    await git.fetch(repo, null);
+    const s = await git.status(repo);
+    assert.strictEqual(s.ahead, 1, 'per main il commit è ancora da pubblicare');
+    assert.ok(await git.isLocalOnly(repo, c.sha), 'non è su origin/main: si considera locale');
+    const r = await git.dropCommit(repo, c.sha, { keepChanges: false });
+    assert.deepStrictEqual(r.alsoOn, ['origin/vecchio-branch'], 'l\'app segnala dove altro si trova');
+    assert.strictEqual((await git.status(repo)).ahead, 0);
+    await git.run(repo, ['push', '-q', 'origin', '--delete', 'vecchio-branch']);
+    await git.fetch(repo, null);
   });
   await t('checkout di un commit (HEAD staccato)', async () => {
     const [, prev] = await git.log(repo, { limit: 2 });
